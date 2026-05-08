@@ -8,14 +8,13 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// MongoDB connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017';
+// MongoDB подключение
+const MONGODB_URI = process.env.MONGODB_URL || 'mongodb://localhost:27017';
 const DB_NAME = 'shooter_game';
 
 let db;
 let players;
 
-// Подключение к MongoDB
 async function connectDB() {
     try {
         const client = new MongoClient(MONGODB_URI);
@@ -23,27 +22,23 @@ async function connectDB() {
         console.log('✅ Connected to MongoDB');
         
         db = client.db(DB_NAME);
-        
-        // Создаём коллекции
         players = db.collection('players');
         
-        // Создаём индексы для быстрого поиска
         await players.createIndex({ telegram_id: 1 }, { unique: true });
         
         console.log('✅ Collections ready');
         return client;
     } catch (error) {
         console.error('❌ MongoDB connection error:', error);
-        process.exit(1);
+        console.log('Retrying in 5 seconds...');
+        setTimeout(connectDB, 5000);
+        return null;
     }
 }
 
-// Health check
 app.get('/', (req, res) => {
     res.json({ status: 'ok', message: 'Shooter Backend running with MongoDB' });
 });
-
-// ============= СОХРАНЕНИЕ ПРОГРЕССА =============
 
 app.post('/api/save', async (req, res) => {
     const { telegram_id, save_data } = req.body;
@@ -52,12 +47,7 @@ app.post('/api/save', async (req, res) => {
     try {
         await players.updateOne(
             { telegram_id: telegram_id },
-            { 
-                $set: { 
-                    save_data: save_data,
-                    updated_at: Date.now()
-                }
-            },
+            { $set: { save_data: save_data, updated_at: Date.now() } },
             { upsert: true }
         );
         res.json({ success: true });
@@ -79,8 +69,6 @@ app.post('/api/load', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
-
-// ============= МОНЕТЫ =============
 
 app.post('/api/coins', async (req, res) => {
     const { telegram_id, coins } = req.body;
@@ -104,8 +92,6 @@ app.post('/api/coins', async (req, res) => {
     }
 });
 
-// ============= РЫНОК =============
-
 app.post('/api/market', async (req, res) => {
     const { telegram_id, marketItems } = req.body;
     if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
@@ -127,8 +113,6 @@ app.post('/api/market', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
-
-// ============= ИСТОРИЯ ПОКУПОК =============
 
 app.post('/api/history', async (req, res) => {
     const { telegram_id, history } = req.body;
@@ -163,7 +147,6 @@ app.post('/api/history/load', async (req, res) => {
     }
 });
 
-// Запуск сервера
 connectDB().then(() => {
     app.listen(port, '0.0.0.0', () => {
         console.log(`🚀 Server running on port ${port}`);
