@@ -47,7 +47,7 @@ app.get('/', (req, res) => {
     res.json({ status: 'ok', message: 'Shooter Backend running' });
 });
 
-// ============= СОХРАНЕНИЕ ВСЕГО ПРОГРЕССА (ЕДИНСТВЕННЫЙ МЕТОД) =============
+// ============= СОХРАНЕНИЕ ВСЕГО ПРОГРЕССА =============
 
 app.post('/api/save', async (req, res) => {
     const { telegram_id, save_data } = req.body;
@@ -59,7 +59,7 @@ app.post('/api/save', async (req, res) => {
             { 
                 $set: { 
                     save_data: save_data,
-                    coins: save_data.coins,  // синхронизируем отдельное поле для быстрого доступа
+                    coins: save_data.coins,
                     updated_at: Date.now() 
                 } 
             },
@@ -83,7 +83,44 @@ app.post('/api/load', async (req, res) => {
     }
 });
 
-// ============= МОНЕТЫ (быстрый доступ, синхронизирован с save_data) =============
+// ============= БОССЫ (серверное хранение времени) =============
+
+// Получить статус боссов для игрока
+app.post('/api/bosses/status', async (req, res) => {
+    const { telegram_id } = req.body;
+    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
+    
+    try {
+        const user = await users.findOne({ telegram_id: telegram_id });
+        const bossTimers = user?.boss_timers || {};
+        res.json({ success: true, bossTimers: bossTimers });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Записать попытку боя с боссом (обновить таймер)
+app.post('/api/bosses/attempt', async (req, res) => {
+    const { telegram_id, bossLevel } = req.body;
+    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
+    
+    try {
+        const now = Date.now();
+        const updateField = {};
+        updateField[`boss_timers.${bossLevel}`] = now;
+        
+        await users.updateOne(
+            { telegram_id: telegram_id },
+            { $set: updateField },
+            { upsert: true }
+        );
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============= МОНЕТЫ (быстрый доступ) =============
 
 app.post('/api/coins', async (req, res) => {
     const { telegram_id, coins } = req.body;
@@ -91,18 +128,12 @@ app.post('/api/coins', async (req, res) => {
     
     try {
         if (coins !== undefined) {
-            // Обновляем монеты И в отдельном поле, И в save_data
-            const user = await users.findOne({ telegram_id: telegram_id });
-            const saveData = user?.save_data || {};
-            saveData.coins = coins;
-            
             await users.updateOne(
                 { telegram_id: telegram_id },
                 { 
                     $set: { 
                         coins: coins,
-                        'save_data.coins': coins,
-                        coins_updated_at: Date.now() 
+                        'save_data.coins': coins
                     } 
                 },
                 { upsert: true }
@@ -110,7 +141,6 @@ app.post('/api/coins', async (req, res) => {
             res.json({ success: true });
         } else {
             const user = await users.findOne({ telegram_id: telegram_id });
-            // Сначала пробуем взять из отдельного поля, потом из save_data
             const coins = user?.coins ?? user?.save_data?.coins ?? 100;
             res.json({ success: true, coins: coins });
         }
@@ -161,13 +191,10 @@ app.post('/api/market/buy', async (req, res) => {
     try {
         const item = await market.findOne({ id: itemId });
         if (!item) return res.status(404).json({ error: 'Item not found' });
-        
-        // Нельзя купить свой же предмет
         if (item.telegram_id === buyer_id) {
             return res.status(400).json({ error: 'Cannot buy your own item' });
         }
         
-        // Получаем данные покупателя
         const buyer = await users.findOne({ telegram_id: buyer_id });
         const buyerCoins = buyer?.coins ?? buyer?.save_data?.coins ?? 100;
         
@@ -175,10 +202,8 @@ app.post('/api/market/buy', async (req, res) => {
             return res.status(400).json({ error: 'Not enough coins' });
         }
         
-        // Списываем монеты у покупателя
         const newBuyerCoins = buyerCoins - item.price;
         
-        // Получаем данные продавца
         const seller = await users.findOne({ telegram_id: item.telegram_id });
         const sellerCoins = seller?.coins ?? seller?.save_data?.coins ?? 0;
         const newSellerCoins = sellerCoins + item.price;
@@ -215,7 +240,6 @@ app.post('/api/market/buy', async (req, res) => {
             { $set: { 'save_data.inventory': inventory } }
         );
         
-        // Удаляем предмет с рынка
         await market.deleteOne({ id: itemId });
         
         res.json({ success: true });
@@ -225,7 +249,7 @@ app.post('/api/market/buy', async (req, res) => {
     }
 });
 
-// Снять предмет с рынка (если продавец передумал)
+// Снять предмет с рынка
 app.post('/api/market/remove', async (req, res) => {
     const { itemId, telegram_id } = req.body;
     if (!itemId || !telegram_id) return res.status(400).json({ error: 'itemId and telegram_id required' });
@@ -235,7 +259,6 @@ app.post('/api/market/remove', async (req, res) => {
         if (!item) return res.status(404).json({ error: 'Item not found' });
         if (item.telegram_id !== telegram_id) return res.status(403).json({ error: 'Not your item' });
         
-        // Возвращаем предмет продавцу
         const seller = await users.findOne({ telegram_id: telegram_id });
         const inventory = seller?.save_data?.inventory || [];
         inventory.push(item.item);
@@ -247,19 +270,6 @@ app.post('/api/market/remove', async (req, res) => {
         
         await market.deleteOne({ id: itemId });
         res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Получить свои выставленные предметы
-app.post('/api/market/my-items', async (req, res) => {
-    const { telegram_id } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
-    
-    try {
-        const items = await market.find({ telegram_id: telegram_id }).toArray();
-        res.json({ success: true, items: items });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
