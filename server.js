@@ -1,426 +1,445 @@
 const express = require('express');
 const cors = require('cors');
-const { MongoClient } = require('mongodb');
-
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
-});
+// ============= ХРАНИЛИЩЕ ДАННЫХ =============
+// В реальном проекте используйте PostgreSQL или MongoDB
+// Для демо используем Map в памяти
+const players = new Map(); // telegram_id -> playerData
+const marketListings = new Map(); // listingId -> listing
+const chatMessages = []; // глобальный чат
+let nextListingId = 1;
 
-const MONGODB_URI = process.env.MONGODB_URL || 'mongodb://localhost:27017';
-const DB_NAME = 'shooter_game';
-
-let db;
-let users;
-let market;
-let chatMessages = [];
-const MAX_CHAT_MESSAGES = 100;
-const MARKET_COMMISSION = 0.10; // 10% комиссия
-
-async function connectDB() {
-    try {
-        const client = new MongoClient(MONGODB_URI);
-        await client.connect();
-        console.log('✅ Connected to MongoDB');
+// ============= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =============
+function getDefaultPlayerData() {
+    return {
+        // Прогресс
+        coins: 100,
+        kills: 0,
+        currentFloor: 1,
+        floorMultiplier: 1,
+        playerLevel: 1,
+        playerExp: 0,
+        expToNextLevel: 100,
         
-        db = client.db(DB_NAME);
-        users = db.collection('users');
-        market = db.collection('market');
+        // Характеристики
+        damage: 10,
+        attackSpeed: 1.0,
+        critChance: 0,
+        critDamage: 1.5,
         
-        await users.createIndex({ telegram_id: 1 }, { unique: true });
+        // Инвентарь и экипировка
+        inventory: [],
+        equipped: {
+            weapon: null,
+            sight: null,
+            laser: null,
+            magazine: null,
+            silencer: null
+        },
         
-        console.log('✅ Database ready');
-        return client;
-    } catch (error) {
-        console.error('❌ MongoDB error:', error);
-        return null;
-    }
+        // Боссы
+        bossFights: {}, // bossLevel -> timestamp
+        isFightingBoss: false,
+        
+        // Временные монеты (для сбора)
+        tempCoins: 0,
+        
+        // Последнее обновление
+        lastUpdated: Date.now()
+    };
 }
 
-app.get('/', (req, res) => {
-    res.json({ status: 'ok', message: 'Shooter Backend running' });
-});
+// ============= API ПРОГРЕССА ИГРОКА =============
 
-// ============= СОХРАНЕНИЕ ПРОГРЕССА =============
-
+// Сохранение всего прогресса
 app.post('/api/save', async (req, res) => {
     const { telegram_id, save_data } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
     
-    try {
-        await users.updateOne(
-            { telegram_id: telegram_id },
-            { 
-                $set: { 
-                    save_data: save_data,
-                    coins: save_data.coins,
-                    updated_at: Date.now() 
-                } 
-            },
-            { upsert: true }
-        );
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
     }
+    
+    let player = players.get(telegram_id);
+    if (!player) {
+        player = getDefaultPlayerData();
+    }
+    
+    // Обновляем данные
+    Object.assign(player, save_data);
+    player.lastUpdated = Date.now();
+    
+    players.set(telegram_id, player);
+    
+    console.log(`💾 Сохранено для ${telegram_id}, монет: ${player.coins}`);
+    res.json({ success: true });
 });
 
+// Загрузка всего прогресса
 app.post('/api/load', async (req, res) => {
     const { telegram_id } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
     
-    try {
-        const user = await users.findOne({ telegram_id: telegram_id });
-        res.json({ success: true, save_data: user?.save_data || null });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
     }
+    
+    let player = players.get(telegram_id);
+    if (!player) {
+        player = getDefaultPlayerData();
+        players.set(telegram_id, player);
+        console.log(`🆕 Новый игрок: ${telegram_id}`);
+    }
+    
+    console.log(`📥 Загружено для ${telegram_id}, монет: ${player.coins}`);
+    res.json({ success: true, save_data: player });
 });
 
-// ============= БОССЫ =============
-
-app.post('/api/bosses/status', async (req, res) => {
-    const { telegram_id } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
-    
-    try {
-        const user = await users.findOne({ telegram_id: telegram_id });
-        const bossTimers = user?.boss_timers || {};
-        res.json({ success: true, bossTimers: bossTimers });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/api/bosses/attempt', async (req, res) => {
-    const { telegram_id, bossLevel } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
-    
-    try {
-        const now = Date.now();
-        const updateField = {};
-        updateField[`boss_timers.${bossLevel}`] = now;
-        
-        await users.updateOne(
-            { telegram_id: telegram_id },
-            { $set: updateField },
-            { upsert: true }
-        );
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ============= ИМЯ ИГРОКА =============
-
-app.post('/api/player/name', async (req, res) => {
-    const { telegram_id, name } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
-    
-    try {
-        await users.updateOne(
-            { telegram_id: telegram_id },
-            { $set: { player_name: name } },
-            { upsert: true }
-        );
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/api/player/name/get', async (req, res) => {
-    const { telegram_id } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
-    
-    try {
-        const user = await users.findOne({ telegram_id: telegram_id });
-        res.json({ success: true, name: user?.player_name || null });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ============= МОНЕТЫ =============
-
+// Синхронизация монет (для временных монет)
 app.post('/api/coins', async (req, res) => {
     const { telegram_id, coins } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
     
-    try {
-        if (coins !== undefined) {
-            await users.updateOne(
-                { telegram_id: telegram_id },
-                { 
-                    $set: { 
-                        coins: coins,
-                        'save_data.coins': coins
-                    } 
-                },
-                { upsert: true }
-            );
-            res.json({ success: true });
-        } else {
-            const user = await users.findOne({ telegram_id: telegram_id });
-            const coins = user?.coins ?? user?.save_data?.coins ?? 100;
-            res.json({ success: true, coins: coins });
-        }
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
     }
+    
+    let player = players.get(telegram_id);
+    if (!player) {
+        player = getDefaultPlayerData();
+        players.set(telegram_id, player);
+    }
+    
+    player.coins = coins;
+    player.lastUpdated = Date.now();
+    
+    res.json({ success: true });
 });
 
-// ============= ГЛОБАЛЬНЫЙ ЧАТ =============
+// ============= API ИМЕНИ ИГРОКА =============
 
-app.get('/api/chat/messages', (req, res) => {
-    res.json({ success: true, messages: chatMessages });
+// Сохранение имени
+app.post('/api/player/name', async (req, res) => {
+    const { telegram_id, name } = req.body;
+    
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
+    }
+    
+    let player = players.get(telegram_id);
+    if (!player) {
+        player = getDefaultPlayerData();
+        players.set(telegram_id, player);
+    }
+    
+    player.name = name;
+    res.json({ success: true });
 });
 
+// Загрузка имени
+app.post('/api/player/name/get', async (req, res) => {
+    const { telegram_id } = req.body;
+    
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
+    }
+    
+    const player = players.get(telegram_id);
+    const name = player?.name || null;
+    
+    res.json({ success: true, name: name });
+});
+
+// ============= API БОССОВ =============
+
+// Сохранение попытки боя с боссом
+app.post('/api/boss/attempt', async (req, res) => {
+    const { telegram_id, bossLevel } = req.body;
+    
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
+    }
+    
+    let player = players.get(telegram_id);
+    if (!player) {
+        player = getDefaultPlayerData();
+        players.set(telegram_id, player);
+    }
+    
+    if (!player.bossFights) player.bossFights = {};
+    player.bossFights[bossLevel] = Date.now();
+    
+    res.json({ success: true });
+});
+
+// Загрузка статуса боссов
+app.post('/api/boss/status', async (req, res) => {
+    const { telegram_id } = req.body;
+    
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
+    }
+    
+    const player = players.get(telegram_id);
+    const bossFights = player?.bossFights || {};
+    
+    res.json({ success: true, bossFights: bossFights });
+});
+
+// ============= API ГЛОБАЛЬНОГО ЧАТА =============
+
+// Получение сообщений чата
+app.get('/api/chat/messages', async (req, res) => {
+    // Возвращаем последние 50 сообщений
+    const recentMessages = chatMessages.slice(-50);
+    res.json({ success: true, messages: recentMessages });
+});
+
+// Отправка сообщения
 app.post('/api/chat/send', async (req, res) => {
     const { telegram_id, username, text } = req.body;
+    
     if (!telegram_id || !text) {
-        return res.status(400).json({ error: 'telegram_id and text required' });
+        return res.status(400).json({ success: false, error: 'Missing data' });
     }
     
     const message = {
-        id: Date.now().toString() + Math.random().toString(36).substr(2, 4),
-        telegram_id: telegram_id,
-        username: username || 'Аноним',
+        id: Date.now(),
+        username: username || 'Игрок',
         text: text.slice(0, 200),
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        telegram_id: telegram_id
     };
     
     chatMessages.push(message);
     
-    if (chatMessages.length > MAX_CHAT_MESSAGES) {
-        chatMessages = chatMessages.slice(-MAX_CHAT_MESSAGES);
+    // Ограничиваем размер чата
+    while (chatMessages.length > 500) {
+        chatMessages.shift();
     }
     
+    console.log(`💬 [Чат] ${message.username}: ${message.text}`);
     res.json({ success: true, message: message });
 });
 
-// ============= ГЛОБАЛЬНЫЙ РЫНОК (с комиссией 10%) =============
+// ============= API РЫНКА =============
 
-// Получить все предметы на рынке
+// Получение всех предметов на рынке
 app.get('/api/market/items', async (req, res) => {
-    try {
-        const items = await market.find({ sold: false }).toArray();
-        res.json({ success: true, items: items });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    const listings = Array.from(marketListings.values())
+        .filter(l => l.active !== false)
+        .sort((a, b) => a.createdAt - b.createdAt);
+    
+    res.json({ success: true, items: listings });
 });
 
-// Выставить предмет на рынок
+// Выставить предмет на продажу
 app.post('/api/market/sell', async (req, res) => {
     const { telegram_id, item, price, sellerName } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
-    if (price < 10) return res.status(400).json({ error: 'Min price is 10 coins' });
     
-    try {
-        const marketItem = {
-            id: Date.now().toString() + Math.random().toString(36).substr(2, 6),
-            telegram_id: telegram_id,
-            sellerName: sellerName || 'Неизвестный',
-            item: item,
-            price: price,
-            created_at: Date.now(),
-            sold: false,
-            commission_claimed: false
-        };
-        
-        await market.insertOne(marketItem);
-        res.json({ success: true, itemId: marketItem.id });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    if (!telegram_id || !item || !price) {
+        return res.status(400).json({ success: false, error: 'Missing data' });
     }
+    
+    if (price < 10) {
+        return res.json({ success: false, error: 'Минимальная цена 10 монет' });
+    }
+    
+    const listingId = (nextListingId++).toString();
+    const listing = {
+        id: listingId,
+        telegram_id: telegram_id,
+        sellerName: sellerName || 'Игрок',
+        item: item,
+        price: price,
+        createdAt: Date.now(),
+        active: true
+    };
+    
+    marketListings.set(listingId, listing);
+    
+    console.log(`📦 Новый лот от ${telegram_id}: ${item.name} за ${price}`);
+    res.json({ success: true, listingId: listingId });
 });
 
-// Купить предмет на рынке (с комиссией)
+// Купить предмет
 app.post('/api/market/buy', async (req, res) => {
     const { itemId, buyer_id, buyerName } = req.body;
-    if (!itemId || !buyer_id) return res.status(400).json({ error: 'itemId and buyer_id required' });
     
-    try {
-        const item = await market.findOne({ id: itemId, sold: false });
-        if (!item) return res.status(404).json({ error: 'Item not found' });
-        if (item.telegram_id === buyer_id) {
-            return res.status(400).json({ error: 'Cannot buy your own item' });
-        }
-        
-        // Получаем покупателя
-        const buyer = await users.findOne({ telegram_id: buyer_id });
-        const buyerCoins = buyer?.coins ?? buyer?.save_data?.coins ?? 100;
-        
-        if (buyerCoins < item.price) {
-            return res.status(400).json({ error: 'Not enough coins' });
-        }
-        
-        // Списываем цену с покупателя
-        const newBuyerCoins = buyerCoins - item.price;
-        
-        // Обновляем покупателя
-        await users.updateOne(
-            { telegram_id: buyer_id },
-            { 
-                $set: { 
-                    coins: newBuyerCoins,
-                    'save_data.coins': newBuyerCoins
-                } 
-            }
-        );
-        
-        // Помечаем предмет как проданный, но монеты продавцу ещё не начислены
-        await market.updateOne(
-            { id: itemId },
-            { 
-                $set: { 
-                    sold: true,
-                    buyer_id: buyer_id,
-                    buyer_name: buyerName,
-                    sold_at: Date.now()
-                } 
-            }
-        );
-        
-        // Добавляем предмет в инвентарь покупателя
-        const buyerData = await users.findOne({ telegram_id: buyer_id });
-        const inventory = buyerData?.save_data?.inventory || [];
-        inventory.push(item.item);
-        
-        await users.updateOne(
-            { telegram_id: buyer_id },
-            { $set: { 'save_data.inventory': inventory } }
-        );
-        
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Market buy error:', error);
-        res.status(500).json({ error: error.message });
+    if (!itemId || !buyer_id) {
+        return res.status(400).json({ success: false, error: 'Missing data' });
     }
+    
+    const listing = marketListings.get(itemId);
+    if (!listing) {
+        return res.json({ success: false, error: 'Предмет не найден' });
+    }
+    
+    if (!listing.active) {
+        return res.json({ success: false, error: 'Предмет уже продан' });
+    }
+    
+    const seller = players.get(listing.telegram_id);
+    const buyer = players.get(buyer_id);
+    
+    if (!buyer) {
+        return res.json({ success: false, error: 'Покупатель не найден' });
+    }
+    
+    if (buyer.coins < listing.price) {
+        return res.json({ success: false, error: 'Не хватает монет' });
+    }
+    
+    // Списываем монеты у покупателя
+    buyer.coins -= listing.price;
+    
+    // Отмечаем предмет как проданный
+    listing.active = false;
+    listing.soldTo = buyer_id;
+    listing.soldAt = Date.now();
+    
+    // Создаём запись о продаже для продавца
+    if (!seller.pendingSales) seller.pendingSales = [];
+    seller.pendingSales.push({
+        id: Date.now(),
+        item: listing.item,
+        price: listing.price,
+        buyerName: buyerName,
+        soldAt: Date.now()
+    });
+    
+    // Добавляем предмет покупателю
+    const purchasedItem = {
+        ...listing.item,
+        id: Date.now() + Math.random(),
+        stats: { ...listing.item.stats, upgradeLevel: listing.item.stats?.upgradeLevel || 0 }
+    };
+    buyer.inventory.push(purchasedItem);
+    
+    players.set(listing.telegram_id, seller);
+    players.set(buyer_id, buyer);
+    
+    console.log(`💰 Покупка: ${buyer_id} купил ${listing.item.name} за ${listing.price} у ${listing.telegram_id}`);
+    res.json({ success: true, item: purchasedItem });
 });
 
-// Получить свои неподтверждённые продажи (монеты ожидают получения)
-app.post('/api/market/my-sales', async (req, res) => {
-    const { telegram_id } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
-    
-    try {
-        const sales = await market.find({ 
-            telegram_id: telegram_id, 
-            sold: true, 
-            commission_claimed: false 
-        }).toArray();
-        res.json({ success: true, sales: sales });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Забрать монеты с продажи (с вычетом 10% комиссии)
-app.post('/api/market/claim', async (req, res) => {
-    const { saleId, telegram_id } = req.body;
-    if (!saleId || !telegram_id) return res.status(400).json({ error: 'saleId and telegram_id required' });
-    
-    try {
-        const sale = await market.findOne({ id: saleId });
-        if (!sale) return res.status(404).json({ error: 'Sale not found' });
-        if (sale.telegram_id !== telegram_id) return res.status(403).json({ error: 'Not your sale' });
-        if (sale.commission_claimed) return res.status(400).json({ error: 'Already claimed' });
-        
-        // Вычисляем сумму с вычетом 10% комиссии
-        const commission = Math.floor(sale.price * MARKET_COMMISSION);
-        const sellerEarn = sale.price - commission;
-        
-        // Начисляем продавцу
-        const seller = await users.findOne({ telegram_id: telegram_id });
-        const sellerCoins = seller?.coins ?? seller?.save_data?.coins ?? 0;
-        const newSellerCoins = sellerCoins + sellerEarn;
-        
-        await users.updateOne(
-            { telegram_id: telegram_id },
-            { 
-                $set: { 
-                    coins: newSellerCoins,
-                    'save_data.coins': newSellerCoins
-                } 
-            }
-        );
-        
-        // Отмечаем как полученное
-        await market.updateOne(
-            { id: saleId },
-            { 
-                $set: { 
-                    commission_claimed: true,
-                    commission_amount: commission,
-                    seller_earned: sellerEarn,
-                    claimed_at: Date.now()
-                } 
-            }
-        );
-        
-        res.json({ success: true, earned: sellerEarn, commission: commission });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Снять предмет с рынка (если продавец передумал)
-app.post('/api/market/remove', async (req, res) => {
-    const { itemId, telegram_id } = req.body;
-    if (!itemId || !telegram_id) return res.status(400).json({ error: 'itemId and telegram_id required' });
-    
-    try {
-        const item = await market.findOne({ id: itemId, sold: false });
-        if (!item) return res.status(404).json({ error: 'Item not found' });
-        if (item.telegram_id !== telegram_id) return res.status(403).json({ error: 'Not your item' });
-        
-        // Возвращаем предмет продавцу
-        const seller = await users.findOne({ telegram_id: telegram_id });
-        const inventory = seller?.save_data?.inventory || [];
-        inventory.push(item.item);
-        
-        await users.updateOne(
-            { telegram_id: telegram_id },
-            { $set: { 'save_data.inventory': inventory } }
-        );
-        
-        await market.deleteOne({ id: itemId });
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Получить свои активные лоты
+// Получить мои лоты
 app.post('/api/market/my-listings', async (req, res) => {
     const { telegram_id } = req.body;
-    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
     
-    try {
-        const listings = await market.find({ 
-            telegram_id: telegram_id, 
-            sold: false 
-        }).toArray();
-        res.json({ success: true, listings: listings });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
     }
+    
+    const myListings = Array.from(marketListings.values())
+        .filter(l => l.telegram_id === telegram_id && l.active === true);
+    
+    res.json({ success: true, listings: myListings });
 });
 
-connectDB().then(() => {
-    app.listen(port, '0.0.0.0', () => {
-        console.log(`🚀 Server running on port ${port}`);
+// Получить неподтверждённые продажи
+app.post('/api/market/my-sales', async (req, res) => {
+    const { telegram_id } = req.body;
+    
+    if (!telegram_id) {
+        return res.status(400).json({ success: false, error: 'No telegram_id' });
+    }
+    
+    const player = players.get(telegram_id);
+    const sales = player?.pendingSales || [];
+    
+    res.json({ success: true, sales: sales });
+});
+
+// Забрать монеты с продажи
+app.post('/api/market/claim', async (req, res) => {
+    const { saleId, telegram_id } = req.body;
+    
+    if (!saleId || !telegram_id) {
+        return res.status(400).json({ success: false, error: 'Missing data' });
+    }
+    
+    const player = players.get(telegram_id);
+    if (!player || !player.pendingSales) {
+        return res.json({ success: false, error: 'Продажа не найдена' });
+    }
+    
+    const saleIndex = player.pendingSales.findIndex(s => s.id == saleId);
+    if (saleIndex === -1) {
+        return res.json({ success: false, error: 'Продажа не найдена' });
+    }
+    
+    const sale = player.pendingSales[saleIndex];
+    const commission = Math.floor(sale.price * 0.1);
+    const earned = sale.price - commission;
+    
+    player.coins += earned;
+    player.pendingSales.splice(saleIndex, 1);
+    
+    players.set(telegram_id, player);
+    
+    console.log(`💰 ${telegram_id} получил ${earned} монет от продажи`);
+    res.json({ success: true, earned: earned, commission: commission });
+});
+
+// Снять предмет с рынка
+app.post('/api/market/remove', async (req, res) => {
+    const { itemId, telegram_id } = req.body;
+    
+    if (!itemId || !telegram_id) {
+        return res.status(400).json({ success: false, error: 'Missing data' });
+    }
+    
+    const listing = marketListings.get(itemId);
+    if (!listing) {
+        return res.json({ success: false, error: 'Предмет не найден' });
+    }
+    
+    if (listing.telegram_id !== telegram_id) {
+        return res.json({ success: false, error: 'Не ваш предмет' });
+    }
+    
+    // Возвращаем предмет продавцу
+    const seller = players.get(telegram_id);
+    if (seller) {
+        const returnedItem = {
+            ...listing.item,
+            id: Date.now() + Math.random(),
+            stats: { ...listing.item.stats, upgradeLevel: listing.item.stats?.upgradeLevel || 0 }
+        };
+        seller.inventory.push(returnedItem);
+        players.set(telegram_id, seller);
+    }
+    
+    // Удаляем лот
+    marketListings.delete(itemId);
+    
+    console.log(`🗑️ ${telegram_id} снял с продажи ${listing.item.name}`);
+    res.json({ success: true, item: listing.item });
+});
+
+// ============= СТАТИСТИКА =============
+app.get('/api/stats', async (req, res) => {
+    const totalPlayers = players.size;
+    const activeListings = Array.from(marketListings.values()).filter(l => l.active).length;
+    const totalMessages = chatMessages.length;
+    
+    res.json({
+        success: true,
+        stats: {
+            players: totalPlayers,
+            listings: activeListings,
+            messages: totalMessages
+        }
     });
+});
+
+// ============= ЗАПУСК СЕРВЕРА =============
+app.listen(PORT, () => {
+    console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`📊 Статистика:`);
+    console.log(`   - API доступно: http://localhost:${PORT}`);
+    console.log(`   - CORS включён для всех`);
 });
