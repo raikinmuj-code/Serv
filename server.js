@@ -5,104 +5,74 @@ const { MongoClient } = require('mongodb');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// CORS настройки
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Дополнительные CORS заголовки
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
-// MongoDB подключение
 const MONGODB_URI = process.env.MONGODB_URL || 'mongodb://localhost:27017';
 const DB_NAME = 'shooter_game';
 
 let db;
-let players;
+let users;
+let market;
 
 async function connectDB() {
     try {
-        const client = new MongoClient(MONGODB_URI, {
-            useNewUrlParser: true,
-            useUnifiedTopology: true
-        });
+        const client = new MongoClient(MONGODB_URI);
         await client.connect();
         console.log('✅ Connected to MongoDB');
         
         db = client.db(DB_NAME);
-        players = db.collection('players');
+        users = db.collection('users');
+        market = db.collection('market');
         
-        // Создаём индекс для быстрого поиска
-        try {
-            await players.createIndex({ telegram_id: 1 }, { unique: true });
-            console.log('✅ Index created');
-        } catch (indexErr) {
-            console.log('Index already exists');
-        }
+        await users.createIndex({ telegram_id: 1 }, { unique: true });
         
         console.log('✅ Database ready');
         return client;
     } catch (error) {
-        console.error('❌ MongoDB connection error:', error);
+        console.error('❌ MongoDB error:', error);
         return null;
     }
 }
 
-// Health check
 app.get('/', (req, res) => {
-    res.json({ status: 'ok', message: 'Shooter Backend running with MongoDB', timestamp: Date.now() });
+    res.json({ status: 'ok', message: 'Shooter Backend running' });
 });
 
 // ============= СОХРАНЕНИЕ ПРОГРЕССА =============
 
 app.post('/api/save', async (req, res) => {
     const { telegram_id, save_data } = req.body;
-    console.log(`📝 Save request for: ${telegram_id}`);
-    
-    if (!telegram_id) {
-        return res.status(400).json({ error: 'telegram_id required' });
-    }
+    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
     
     try {
-        const result = await players.updateOne(
+        await users.updateOne(
             { telegram_id: telegram_id },
-            { 
-                $set: { 
-                    save_data: save_data, 
-                    updated_at: Date.now() 
-                }
-            },
+            { $set: { save_data: save_data, updated_at: Date.now() } },
             { upsert: true }
         );
-        console.log(`✅ Saved for ${telegram_id}`);
         res.json({ success: true });
     } catch (error) {
-        console.error('❌ Save error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.post('/api/load', async (req, res) => {
     const { telegram_id } = req.body;
-    console.log(`📥 Load request for: ${telegram_id}`);
-    
-    if (!telegram_id) {
-        return res.status(400).json({ error: 'telegram_id required' });
-    }
+    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
     
     try {
-        const player = await players.findOne({ telegram_id: telegram_id });
-        console.log(`✅ Loaded for ${telegram_id}: ${player ? 'found' : 'not found'}`);
-        res.json({ success: true, save_data: player?.save_data || null });
+        const user = await users.findOne({ telegram_id: telegram_id });
+        res.json({ success: true, save_data: user?.save_data || null });
     } catch (error) {
-        console.error('❌ Load error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -111,114 +81,137 @@ app.post('/api/load', async (req, res) => {
 
 app.post('/api/coins', async (req, res) => {
     const { telegram_id, coins } = req.body;
-    console.log(`💰 Coins request for: ${telegram_id}, coins: ${coins}`);
-    
-    if (!telegram_id) {
-        return res.status(400).json({ error: 'telegram_id required' });
-    }
+    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
     
     try {
         if (coins !== undefined) {
-            await players.updateOne(
+            await users.updateOne(
                 { telegram_id: telegram_id },
                 { $set: { coins: coins, coins_updated_at: Date.now() } },
                 { upsert: true }
             );
-            console.log(`✅ Coins saved: ${coins}`);
             res.json({ success: true });
         } else {
-            const player = await players.findOne({ telegram_id: telegram_id });
-            const coinBalance = player?.coins || 100;
-            console.log(`✅ Coins loaded: ${coinBalance}`);
-            res.json({ success: true, coins: coinBalance });
+            const user = await users.findOne({ telegram_id: telegram_id });
+            res.json({ success: true, coins: user?.coins || 100 });
         }
     } catch (error) {
-        console.error('❌ Coins error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// ============= РЫНОК =============
+// ============= ГЛОБАЛЬНЫЙ РЫНОК =============
 
-app.post('/api/market', async (req, res) => {
-    const { telegram_id, marketItems } = req.body;
-    console.log(`🏪 Market request for: ${telegram_id}`);
-    
-    if (!telegram_id) {
-        return res.status(400).json({ error: 'telegram_id required' });
-    }
-    
+// Получить все предметы на рынке
+app.get('/api/market/items', async (req, res) => {
     try {
-        if (marketItems !== undefined) {
-            await players.updateOne(
-                { telegram_id: telegram_id },
-                { $set: { market_items: marketItems, market_updated_at: Date.now() } },
-                { upsert: true }
-            );
-            console.log(`✅ Market saved: ${marketItems.length} items`);
-            res.json({ success: true });
-        } else {
-            const player = await players.findOne({ telegram_id: telegram_id });
-            const items = player?.market_items || [];
-            console.log(`✅ Market loaded: ${items.length} items`);
-            res.json({ success: true, marketItems: items });
-        }
+        const items = await market.find({}).toArray();
+        res.json({ success: true, items: items });
     } catch (error) {
-        console.error('❌ Market error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// ============= ИСТОРИЯ ПОКУПОК =============
-
-app.post('/api/history', async (req, res) => {
-    const { telegram_id, history } = req.body;
-    console.log(`📜 History save for: ${telegram_id}`);
-    
-    if (!telegram_id) {
-        return res.status(400).json({ error: 'telegram_id required' });
-    }
+// Выставить предмет на рынок
+app.post('/api/market/sell', async (req, res) => {
+    const { telegram_id, item, price, sellerName } = req.body;
+    if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
     
     try {
-        await players.updateOne(
-            { telegram_id: telegram_id },
-            { $set: { purchase_history: history, history_updated_at: Date.now() } },
-            { upsert: true }
+        const marketItem = {
+            id: Date.now().toString() + Math.random(),
+            telegram_id: telegram_id,
+            sellerName: sellerName || 'Неизвестный',
+            item: item,
+            price: price,
+            created_at: Date.now()
+        };
+        
+        await market.insertOne(marketItem);
+        res.json({ success: true, itemId: marketItem.id });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Купить предмет на рынке
+app.post('/api/market/buy', async (req, res) => {
+    const { itemId, buyer_id, buyerName } = req.body;
+    if (!itemId || !buyer_id) return res.status(400).json({ error: 'itemId and buyer_id required' });
+    
+    try {
+        const item = await market.findOne({ id: itemId });
+        if (!item) return res.status(404).json({ error: 'Item not found' });
+        
+        // Проверяем баланс покупателя
+        const buyer = await users.findOne({ telegram_id: buyer_id });
+        if (!buyer || (buyer.coins || 100) < item.price) {
+            return res.status(400).json({ error: 'Not enough coins' });
+        }
+        
+        // Списываем монеты у покупателя
+        await users.updateOne(
+            { telegram_id: buyer_id },
+            { $set: { coins: (buyer.coins || 100) - item.price } }
         );
-        console.log(`✅ History saved`);
+        
+        // Добавляем монеты продавцу
+        const seller = await users.findOne({ telegram_id: item.telegram_id });
+        if (seller) {
+            await users.updateOne(
+                { telegram_id: item.telegram_id },
+                { $set: { coins: (seller.coins || 0) + item.price } }
+            );
+        }
+        
+        // Удаляем предмет с рынка
+        await market.deleteOne({ id: itemId });
+        
+        // Передаём предмет покупателю в инвентарь
+        const buyerData = await users.findOne({ telegram_id: buyer_id });
+        const inventory = buyerData?.save_data?.inventory || [];
+        inventory.push(item.item);
+        
+        await users.updateOne(
+            { telegram_id: buyer_id },
+            { $set: { 'save_data.inventory': inventory } }
+        );
+        
         res.json({ success: true });
     } catch (error) {
-        console.error('❌ History error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-app.post('/api/history/load', async (req, res) => {
-    const { telegram_id } = req.body;
-    console.log(`📜 History load for: ${telegram_id}`);
-    
-    if (!telegram_id) {
-        return res.status(400).json({ error: 'telegram_id required' });
-    }
+// Снять предмет с рынка (если продавец передумал)
+app.post('/api/market/remove', async (req, res) => {
+    const { itemId, telegram_id } = req.body;
+    if (!itemId || !telegram_id) return res.status(400).json({ error: 'itemId and telegram_id required' });
     
     try {
-        const player = await players.findOne({ telegram_id: telegram_id });
-        const history = player?.purchase_history || { shop: [], market: [], lastVisit: 0 };
-        console.log(`✅ History loaded`);
-        res.json({ 
-            success: true, 
-            history: history
-        });
+        const item = await market.findOne({ id: itemId });
+        if (!item) return res.status(404).json({ error: 'Item not found' });
+        if (item.telegram_id !== telegram_id) return res.status(403).json({ error: 'Not your item' });
+        
+        // Возвращаем предмет продавцу
+        const seller = await users.findOne({ telegram_id: telegram_id });
+        const inventory = seller?.save_data?.inventory || [];
+        inventory.push(item.item);
+        
+        await users.updateOne(
+            { telegram_id: telegram_id },
+            { $set: { 'save_data.inventory': inventory } }
+        );
+        
+        await market.deleteOne({ id: itemId });
+        res.json({ success: true });
     } catch (error) {
-        console.error('❌ Load history error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Запуск сервера
 connectDB().then(() => {
     app.listen(port, '0.0.0.0', () => {
         console.log(`🚀 Server running on port ${port}`);
-        console.log(`📍 URL: http://localhost:${port}`);
     });
 });
