@@ -300,15 +300,16 @@ app.post('/api/market/buy', async (req, res) => {
     listing.soldTo = buyer_id;
     listing.soldAt = Date.now();
     
-    // Создаём запись о продаже для продавца
-    if (!seller.pendingSales) seller.pendingSales = [];
-    seller.pendingSales.push({
-        id: Date.now(),
-        item: listing.item,
-        price: listing.price,
-        buyerName: buyerName,
-        soldAt: Date.now()
-    });
+// Создаём запись о продаже для продавца
+if (!seller.pendingSales) seller.pendingSales = [];
+seller.pendingSales.push({
+    id: Date.now(),
+    item: listing.item,
+    price: listing.price,
+    buyerName: buyerName,
+    soldAt: Date.now(),
+    claimed: false   // ← ДОБАВЬ ЭТУ СТРОКУ
+});
     
     // Добавляем предмет покупателю
     const purchasedItem = {
@@ -372,11 +373,17 @@ app.post('/api/market/claim', async (req, res) => {
     }
     
     const sale = player.pendingSales[saleIndex];
+    
+    // ПРОВЕРКА: уже получено?
+    if (sale.claimed) {
+        return res.json({ success: false, error: 'Монеты уже получены' });
+    }
+    
     const commission = Math.floor(sale.price * 0.1);
     const earned = sale.price - commission;
     
     player.coins += earned;
-    player.pendingSales.splice(saleIndex, 1);
+    sale.claimed = true;  // ОТМЕЧАЕМ КАК ПОЛУЧЕННОЕ
     
     players.set(telegram_id, player);
     
