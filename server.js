@@ -8,15 +8,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============= MIDDLEWARE =============
-// Разрешаем CORS для всех (для GitHub Pages)
+// Полный CORS для всех источников
 app.use(cors({
     origin: '*',
-    credentials: true
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-// Раздача статики из корневой папки (для HTML, CSS, JS)
+// Раздача статических файлов из корневой папки
 app.use(express.static(path.join(__dirname, '..')));
 
 // ============= БАЗА ДАННЫХ =============
@@ -24,7 +27,7 @@ const db = new sqlite3.Database('./database.db');
 
 // Создание таблиц
 db.serialize(() => {
-    // Таблица пользователей
+    // Таблица пользователей (расширенная)
     db.run(`
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -33,7 +36,13 @@ db.serialize(() => {
             balance REAL DEFAULT 0,
             level INTEGER DEFAULT 1,
             ads INTEGER DEFAULT 0,
-            created_at INTEGER DEFAULT (unixepoch())
+            is_premium INTEGER DEFAULT 0,
+            language TEXT DEFAULT 'ru',
+            telegram_id TEXT,
+            referrer_id TEXT,
+            total_views INTEGER DEFAULT 0,
+            created_at INTEGER DEFAULT (unixepoch()),
+            last_active INTEGER DEFAULT (unixepoch())
         )
     `);
     
@@ -49,6 +58,32 @@ db.serialize(() => {
         )
     `);
     
+    // Таблица рефералов
+    db.run(`
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id TEXT,
+            referred_id TEXT,
+            reward REAL DEFAULT 0,
+            created_at INTEGER DEFAULT (unixepoch()),
+            FOREIGN KEY (referrer_id) REFERENCES users(id),
+            FOREIGN KEY (referred_id) REFERENCES users(id)
+        )
+    `);
+    
+    // Таблица транзакций
+    db.run(`
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            type TEXT,
+            amount REAL,
+            description TEXT,
+            created_at INTEGER DEFAULT (unixepoch()),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    `);
+    
     console.log('✅ База данных инициализирована');
 });
 
@@ -58,8 +93,14 @@ function generateUsername() {
     return names[Math.floor(Math.random() * names.length)] + Math.floor(Math.random() * 1000);
 }
 
-function generateAvatar() {
-    return `https://i.pravatar.cc/100?img=${Math.floor(Math.random() * 70)}`;
+function logTransaction(userId, type, amount, description) {
+    db.run(
+        'INSERT INTO transactions (user_id, type, amount, description) VALUES (?, ?, ?, ?)',
+        [userId, type, amount, description],
+        (err) => {
+            if (err) console.error('Ошибка записи транзакции:', err);
+        }
+    );
 }
 
 // ============= API ENDPOINTS =============
@@ -69,10 +110,22 @@ function generateAvatar() {
  * Создание или получение пользователя
  */
 app.post('/api/user', (req, res) => {
-    const { userId, username, avatar } = req.body;
-    const id = userId || uuidv4();
+    const { 
+        userId, 
+        username, 
+        firstName, 
+        lastName, 
+        avatar, 
+        languageCode, 
+        isPremium,
+        referrerId 
+    } = req.body;
     
-    console.log(`📌 Запрос пользователя: ${id}`);
+    const id = userId || `tg_${uuidv4()}`;
+    const displayName = username || firstName || generateUsername();
+    const userAvatar = avatar || `https://i.pravatar.cc/100?img=${Math.floor(Math.random() * 70)}`;
+    
+    console.log(`📌 Запрос пользователя: ${id}, Имя: ${displayName}`);
     
     db.get('SELECT * FROM users WHERE id = ?', [id], (err, user) => {
         if (err) {
@@ -81,7 +134,19 @@ app.post('/api/user', (req, res) => {
         }
         
         if (user) {
-            // Пользователь существует — загружаем его блоки
+            // Обновляем данные пользователя
+            db.run(
+                `UPDATE users SET 
+                    username = ?, 
+                    avatar = ?, 
+                    is_premium = ?, 
+                    language = ?,
+                    last_active = unixepoch()
+                WHERE id = ?`,
+                [displayName, userAvatar, isPremium ? 1 : 0, languageCode || 'ru', id]
+            );
+            
+            // Загружаем блоки
             db.all('SELECT block_id, views, locked_until FROM user_blocks WHERE user_id = ?', [id], (err, blocks) => {
                 if (err) {
                     return res.status(500).json({ error: err.message });
@@ -92,53 +157,70 @@ app.post('/api/user', (req, res) => {
                     blocksData[b.block_id] = { v: b.views, l: b.locked_until };
                 });
                 
-                console.log(`✅ Пользователь загружен: ${user.username}`);
+                console.log(`✅ Пользователь загружен: ${displayName} (${id})`);
                 
                 res.json({
                     success: true,
                     user: {
                         id: user.id,
-                        username: user.username,
-                        avatar: user.avatar,
+                        username: displayName,
+                        avatar: userAvatar,
                         balance: user.balance,
                         level: user.level,
-                        ads: user.ads
+                        ads: user.ads,
+                        totalViews: user.total_views || 0
                     },
                     blocks: blocksData
                 });
             });
         } else {
             // Создаём нового пользователя
-            const newUsername = username || generateUsername();
-            const newAvatar = avatar || generateAvatar();
-            
             db.run(
-                'INSERT INTO users (id, username, avatar, balance, level, ads) VALUES (?, ?, ?, ?, ?, ?)',
-                [id, newUsername, newAvatar, 0, 1, 0],
+                `INSERT INTO users 
+                 (id, username, avatar, balance, level, ads, is_premium, language, telegram_id, referrer_id) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [id, displayName, userAvatar, 0, 1, 0, isPremium ? 1 : 0, languageCode || 'ru', id.replace('tg_', ''), referrerId || null],
                 (err) => {
                     if (err) {
                         console.error('❌ Ошибка создания:', err);
                         return res.status(500).json({ error: err.message });
                     }
                     
-                    // Создаём 3 блока для нового пользователя
+                    // Создаём 3 блока для пользователя
                     const stmt = db.prepare('INSERT INTO user_blocks (user_id, block_id, views, locked_until) VALUES (?, ?, ?, ?)');
                     for (let i = 1; i <= 3; i++) {
                         stmt.run(id, i, 0, 0);
                     }
                     stmt.finalize();
                     
-                    console.log(`🆕 Новый пользователь: ${newUsername} (${id})`);
+                    // Если есть реферер — начисляем бонус
+                    if (referrerId && referrerId !== id) {
+                        const bonusAmount = 0.01;
+                        db.run('UPDATE users SET balance = balance + ? WHERE id = ?', [bonusAmount, referrerId]);
+                        
+                        db.run(
+                            'INSERT INTO referrals (referrer_id, referred_id, reward) VALUES (?, ?, ?)',
+                            [referrerId, id, bonusAmount]
+                        );
+                        
+                        logTransaction(referrerId, 'referral_bonus', bonusAmount, `За приглашение ${displayName}`);
+                        console.log(`🎁 Реферальный бонус: ${referrerId} +${bonusAmount}$ за приглашение ${id}`);
+                    }
+                    
+                    logTransaction(id, 'registration', 0, 'Регистрация нового пользователя');
+                    
+                    console.log(`🆕 Новый пользователь: ${displayName} (${id})`);
                     
                     res.json({
                         success: true,
                         user: {
                             id: id,
-                            username: newUsername,
-                            avatar: newAvatar,
+                            username: displayName,
+                            avatar: userAvatar,
                             balance: 0,
                             level: 1,
-                            ads: 0
+                            ads: 0,
+                            totalViews: 0
                         },
                         blocks: {}
                     });
@@ -159,12 +241,16 @@ app.post('/api/save', (req, res) => {
         return res.status(400).json({ error: 'userId required' });
     }
     
-    console.log(`💾 Сохранение прогресса: ${userId}, баланс: ${user.balance}`);
-    
     // Обновляем пользователя
     db.run(
-        'UPDATE users SET balance = ?, level = ?, ads = ? WHERE id = ?',
-        [user.balance, user.level, user.ads, userId],
+        `UPDATE users SET 
+            balance = ?, 
+            level = ?, 
+            ads = ?,
+            total_views = total_views + ?,
+            last_active = unixepoch()
+        WHERE id = ?`,
+        [user.balance, user.level, user.ads, user.adsIncrement || 0, userId],
         (err) => {
             if (err) {
                 console.error('❌ Ошибка сохранения пользователя:', err);
@@ -188,7 +274,7 @@ app.post('/api/save', (req, res) => {
             
             Promise.all(promises)
                 .then(() => {
-                    console.log(`✅ Прогресс сохранён`);
+                    console.log(`💾 Прогресс сохранён: ${userId}, баланс: ${user.balance}`);
                     res.json({ success: true });
                 })
                 .catch(err => {
@@ -205,7 +291,7 @@ app.post('/api/save', (req, res) => {
  */
 app.get('/api/leaderboard', (req, res) => {
     db.all(
-        `SELECT id, username, avatar, balance, level 
+        `SELECT id, username, avatar, balance, level, total_views 
          FROM users 
          ORDER BY balance DESC 
          LIMIT 50`,
@@ -230,7 +316,8 @@ app.get('/api/stats', (req, res) => {
         `SELECT 
             COUNT(*) as totalUsers,
             SUM(balance) as totalBalance,
-            AVG(level) as avgLevel
+            AVG(level) as avgLevel,
+            SUM(total_views) as totalViews
          FROM users`,
         (err, row) => {
             if (err) {
@@ -241,7 +328,8 @@ app.get('/api/stats', (req, res) => {
             res.json({
                 totalUsers: row.totalUsers || 0,
                 totalBalance: row.totalBalance || 0,
-                avgLevel: Math.round((row.avgLevel || 1) * 10) / 10
+                avgLevel: Math.round((row.avgLevel || 1) * 10) / 10,
+                totalViews: row.totalViews || 0
             });
         }
     );
@@ -275,13 +363,56 @@ app.get('/api/user/:id', (req, res) => {
 });
 
 /**
+ * GET /api/referrals/:id
+ * Получение рефералов пользователя
+ */
+app.get('/api/referrals/:id', (req, res) => {
+    const { id } = req.params;
+    
+    db.all(
+        `SELECT r.*, u.username, u.avatar, u.level 
+         FROM referrals r 
+         JOIN users u ON r.referred_id = u.id 
+         WHERE r.referrer_id = ? 
+         ORDER BY r.created_at DESC`,
+        [id],
+        (err, rows) => {
+            if (err) {
+                return res.status(500).json({ error: err.message });
+            }
+            res.json(rows);
+        }
+    );
+});
+
+/**
+ * GET /api/transactions/:id
+ * Получение транзакций пользователя
+ */
+app.get('/api/transactions/:id', (req, res) => {
+    const { id } = req.params;
+    const limit = req.query.limit || 50;
+    
+    db.all(
+        'SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
+        [id, limit],
+        (err, rows) => {
+            if (err) {
+                return res.status(500).json({ error: err.message });
+            }
+            res.json(rows);
+        }
+    );
+});
+
+/**
  * POST /api/reset/:id
  * Сброс прогресса пользователя (для тестирования)
  */
 app.post('/api/reset/:id', (req, res) => {
     const { id } = req.params;
     
-    db.run('UPDATE users SET balance = 0, level = 1, ads = 0 WHERE id = ?', [id], (err) => {
+    db.run('UPDATE users SET balance = 0, level = 1, ads = 0, total_views = 0 WHERE id = ?', [id], (err) => {
         if (err) {
             return res.status(500).json({ error: err.message });
         }
@@ -291,6 +422,7 @@ app.post('/api/reset/:id', (req, res) => {
                 return res.status(500).json({ error: err.message });
             }
             
+            logTransaction(id, 'reset', 0, 'Сброс прогресса');
             res.json({ success: true, message: 'Progress reset' });
         });
     });
@@ -304,26 +436,47 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         timestamp: new Date().toISOString(),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        database: 'connected'
     });
 });
 
 /**
- * Корневой маршрут — отдаём index.html
+ * GET / — корневой маршрут
  */
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, '..', 'index.html'));
 });
 
+/**
+ * Обработка 404
+ */
+app.use('*', (req, res) => {
+    res.status(404).json({ error: 'Not found' });
+});
+
+/**
+ * Обработка ошибок
+ */
+app.use((err, req, res, next) => {
+    console.error('❌ Ошибка сервера:', err);
+    res.status(500).json({ error: 'Internal server error' });
+});
+
 // ============= ЗАПУСК СЕРВЕРА =============
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`
-╔════════════════════════════════════════╗
-║     🚀 СЕРВЕР ЗАПУЩЕН!                 ║
-╠════════════════════════════════════════╣
-║  Порт: ${PORT}                             
-║  API:  http://localhost:${PORT}/api     
-║  Health: http://localhost:${PORT}/health
-╚════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════╗
+║                     🚀 СЕРВЕР ЗАПУЩЕН                      ║
+╠══════════════════════════════════════════════════════════╣
+║  Порт: ${PORT}                                              
+║  API:  http://localhost:${PORT}/api                        
+║  Health: http://localhost:${PORT}/health                   
+║  Лидерборд: http://localhost:${PORT}/api/leaderboard       
+╠══════════════════════════════════════════════════════════╣
+║  ✅ База данных SQLite подключена                          
+║  ✅ CORS разрешён для всех                                 
+║  ✅ Статика из корневой папки                              
+╚══════════════════════════════════════════════════════════╝
     `);
 });
