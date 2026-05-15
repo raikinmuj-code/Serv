@@ -1,5 +1,5 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { MongoClient } = require('mongodb');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
@@ -8,83 +8,70 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============= MIDDLEWARE =============
-app.use(cors({
-    origin: '*',
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
+app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ============= ПУТИ ДЛЯ СТАТИКИ (ВАЖНО!) =============
-// Корневая папка проекта (на уровень выше backend)
+// ============= ПУТИ ДЛЯ СТАТИКИ =============
 const rootPath = path.join(__dirname, '..');
-console.log('📁 Корневая папка:', rootPath);
-
-// Раздаём статические файлы из корня
 app.use(express.static(rootPath));
 
-// ============= БАЗА ДАННЫХ =============
-const db = new sqlite3.Database(path.join(__dirname, 'database.db'));
+// ============= ПОДКЛЮЧЕНИЕ К MONGODB =============
+// Пробуем разные возможные переменные окружения
+const MONGODB_URI = process.env.MONGODB_URI || process.env.MONGO_URL || process.env.DATABASE_URL || 'mongodb://localhost:27017';
+const DB_NAME = process.env.DB_NAME || 'duckads';
 
-db.serialize(() => {
-    db.run(`
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT,
-            avatar TEXT,
-            balance REAL DEFAULT 0,
-            level INTEGER DEFAULT 1,
-            ads INTEGER DEFAULT 0,
-            is_premium INTEGER DEFAULT 0,
-            language TEXT DEFAULT 'ru',
-            telegram_id TEXT,
-            referrer_id TEXT,
-            total_views INTEGER DEFAULT 0,
-            created_at INTEGER DEFAULT (unixepoch()),
-            last_active INTEGER DEFAULT (unixepoch())
-        )
-    `);
-    
-    db.run(`
-        CREATE TABLE IF NOT EXISTS user_blocks (
-            user_id TEXT,
-            block_id INTEGER,
-            views INTEGER DEFAULT 0,
-            locked_until INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, block_id),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    `);
-    
-    db.run(`
-        CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id TEXT,
-            referred_id TEXT,
-            reward REAL DEFAULT 0,
-            created_at INTEGER DEFAULT (unixepoch()),
-            FOREIGN KEY (referrer_id) REFERENCES users(id),
-            FOREIGN KEY (referred_id) REFERENCES users(id)
-        )
-    `);
-    
-    db.run(`
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            type TEXT,
-            amount REAL,
-            description TEXT,
-            created_at INTEGER DEFAULT (unixepoch()),
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    `);
-    
-    console.log('✅ База данных инициализирована');
-});
+console.log('🔍 Переменные окружения:');
+console.log('   MONGODB_URI:', MONGODB_URI ? '✅ задана' : '❌ не задана');
+console.log('   DB_NAME:', DB_NAME);
+
+let db;
+let usersCollection;
+let blocksCollection;
+let referralsCollection;
+let transactionsCollection;
+
+async function connectDB() {
+    try {
+        console.log('🔄 Подключение к MongoDB...');
+        console.log('   URI:', MONGODB_URI.replace(/:[^:]*@/, ':****@')); // Скрываем пароль
+        
+        const client = new MongoClient(MONGODB_URI, {
+            connectTimeoutMS: 10000,
+            serverSelectionTimeoutMS: 10000
+        });
+        
+        await client.connect();
+        console.log('✅ Подключено к MongoDB');
+        
+        db = client.db(DB_NAME);
+        usersCollection = db.collection('users');
+        blocksCollection = db.collection('user_blocks');
+        referralsCollection = db.collection('referrals');
+        transactionsCollection = db.collection('transactions');
+        
+        // Создаём индексы
+        await usersCollection.createIndex({ id: 1 }, { unique: true });
+        await usersCollection.createIndex({ telegram_id: 1 });
+        await usersCollection.createIndex({ balance: -1 });
+        await blocksCollection.createIndex({ user_id: 1, block_id: 1 }, { unique: true });
+        await referralsCollection.createIndex({ referrer_id: 1 });
+        await transactionsCollection.createIndex({ user_id: 1 });
+        await transactionsCollection.createIndex({ created_at: -1 });
+        
+        console.log('✅ Индексы созданы');
+        
+        // Проверяем, есть ли данные
+        const userCount = await usersCollection.countDocuments();
+        console.log(`📊 В базе уже ${userCount} пользователей`);
+        
+        return true;
+    } catch (error) {
+        console.error('❌ Ошибка подключения к MongoDB:', error.message);
+        console.error('   Полная ошибка:', error);
+        return false;
+    }
+}
 
 // ============= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =============
 function generateUsername() {
@@ -92,19 +79,26 @@ function generateUsername() {
     return names[Math.floor(Math.random() * names.length)] + Math.floor(Math.random() * 1000);
 }
 
-function logTransaction(userId, type, amount, description) {
-    db.run(
-        'INSERT INTO transactions (user_id, type, amount, description) VALUES (?, ?, ?, ?)',
-        [userId, type, amount, description],
-        (err) => {
-            if (err) console.error('Ошибка записи транзакции:', err);
-        }
-    );
+async function logTransaction(userId, type, amount, description) {
+    try {
+        await transactionsCollection.insertOne({
+            user_id: userId,
+            type,
+            amount,
+            description,
+            created_at: Date.now()
+        });
+    } catch (error) {
+        console.error('Ошибка записи транзакции:', error);
+    }
 }
 
 // ============= API ENDPOINTS =============
 
-app.post('/api/user', (req, res) => {
+// 1. Регистрация/получение пользователя
+app.post('/api/user', async (req, res) => {
+    console.log('📌 POST /api/user', req.body);
+    
     const { 
         userId, 
         username, 
@@ -120,284 +114,239 @@ app.post('/api/user', (req, res) => {
     const displayName = username || firstName || generateUsername();
     const userAvatar = avatar || `https://i.pravatar.cc/100?img=${Math.floor(Math.random() * 70)}`;
     
-    console.log(`📌 Запрос пользователя: ${id}, Имя: ${displayName}`);
+    console.log(`👤 Пользователь: ${id}, Имя: ${displayName}`);
     
-    db.get('SELECT * FROM users WHERE id = ?', [id], (err, user) => {
-        if (err) {
-            console.error('❌ Ошибка БД:', err);
-            return res.status(500).json({ error: err.message });
-        }
+    try {
+        let user = await usersCollection.findOne({ id });
         
         if (user) {
-            db.run(
-                `UPDATE users SET 
-                    username = ?, 
-                    avatar = ?, 
-                    is_premium = ?, 
-                    language = ?,
-                    last_active = unixepoch()
-                WHERE id = ?`,
-                [displayName, userAvatar, isPremium ? 1 : 0, languageCode || 'ru', id]
-            );
+            console.log(`✅ Существующий пользователь: ${displayName}`);
             
-            db.all('SELECT block_id, views, locked_until FROM user_blocks WHERE user_id = ?', [id], (err, blocks) => {
-                if (err) {
-                    return res.status(500).json({ error: err.message });
-                }
-                
-                const blocksData = {};
-                blocks.forEach(b => {
-                    blocksData[b.block_id] = { v: b.views, l: b.locked_until };
-                });
-                
-                console.log(`✅ Пользователь загружен: ${displayName} (${id})`);
-                
-                res.json({
-                    success: true,
-                    user: {
-                        id: user.id,
+            // Обновляем активность
+            await usersCollection.updateOne(
+                { id },
+                { 
+                    $set: {
                         username: displayName,
                         avatar: userAvatar,
-                        balance: user.balance,
-                        level: user.level,
-                        ads: user.ads,
-                        totalViews: user.total_views || 0
-                    },
-                    blocks: blocksData
-                });
-            });
-        } else {
-            db.run(
-                `INSERT INTO users 
-                 (id, username, avatar, balance, level, ads, is_premium, language, telegram_id, referrer_id) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [id, displayName, userAvatar, 0, 1, 0, isPremium ? 1 : 0, languageCode || 'ru', id.replace('tg_', ''), referrerId || null],
-                (err) => {
-                    if (err) {
-                        console.error('❌ Ошибка создания:', err);
-                        return res.status(500).json({ error: err.message });
+                        is_premium: isPremium || false,
+                        language: languageCode || 'ru',
+                        last_active: Date.now()
                     }
-                    
-                    const stmt = db.prepare('INSERT INTO user_blocks (user_id, block_id, views, locked_until) VALUES (?, ?, ?, ?)');
-                    for (let i = 1; i <= 3; i++) {
-                        stmt.run(id, i, 0, 0);
-                    }
-                    stmt.finalize();
-                    
-                    if (referrerId && referrerId !== id) {
-                        const bonusAmount = 0.01;
-                        db.run('UPDATE users SET balance = balance + ? WHERE id = ?', [bonusAmount, referrerId]);
-                        db.run('INSERT INTO referrals (referrer_id, referred_id, reward) VALUES (?, ?, ?)', [referrerId, id, bonusAmount]);
-                        logTransaction(referrerId, 'referral_bonus', bonusAmount, `За приглашение ${displayName}`);
-                        console.log(`🎁 Реферальный бонус: ${referrerId} +${bonusAmount}$`);
-                    }
-                    
-                    logTransaction(id, 'registration', 0, 'Регистрация нового пользователя');
-                    console.log(`🆕 Новый пользователь: ${displayName} (${id})`);
-                    
-                    res.json({
-                        success: true,
-                        user: {
-                            id: id,
-                            username: displayName,
-                            avatar: userAvatar,
-                            balance: 0,
-                            level: 1,
-                            ads: 0,
-                            totalViews: 0
-                        },
-                        blocks: {}
-                    });
                 }
             );
+            
+            // Получаем блоки
+            const blocks = await blocksCollection.find({ user_id: id }).toArray();
+            const blocksData = {};
+            blocks.forEach(b => {
+                blocksData[b.block_id] = { v: b.views, l: b.locked_until };
+            });
+            
+            res.json({
+                success: true,
+                user: {
+                    id: user.id,
+                    username: displayName,
+                    avatar: userAvatar,
+                    balance: user.balance || 0,
+                    level: user.level || 1,
+                    ads: user.ads || 0,
+                    totalViews: user.total_views || 0
+                },
+                blocks: blocksData
+            });
+        } else {
+            console.log(`🆕 Новый пользователь: ${displayName}`);
+            
+            // Создаём нового пользователя
+            const newUser = {
+                id,
+                username: displayName,
+                avatar: userAvatar,
+                balance: 0,
+                level: 1,
+                ads: 0,
+                is_premium: isPremium || false,
+                language: languageCode || 'ru',
+                telegram_id: id.replace('tg_', ''),
+                referrer_id: referrerId || null,
+                total_views: 0,
+                created_at: Date.now(),
+                last_active: Date.now()
+            };
+            
+            await usersCollection.insertOne(newUser);
+            
+            // Создаём 3 блока
+            for (let i = 1; i <= 3; i++) {
+                await blocksCollection.insertOne({
+                    user_id: id,
+                    block_id: i,
+                    views: 0,
+                    locked_until: 0
+                });
+            }
+            
+            // Реферальный бонус
+            if (referrerId && referrerId !== id) {
+                const bonusAmount = 0.01;
+                await usersCollection.updateOne(
+                    { id: referrerId },
+                    { $inc: { balance: bonusAmount } }
+                );
+                
+                await referralsCollection.insertOne({
+                    referrer_id: referrerId,
+                    referred_id: id,
+                    reward: bonusAmount,
+                    created_at: Date.now()
+                });
+                
+                await logTransaction(referrerId, 'referral_bonus', bonusAmount, `За приглашение ${displayName}`);
+                console.log(`🎁 Реферальный бонус: ${referrerId} +${bonusAmount}$`);
+            }
+            
+            await logTransaction(id, 'registration', 0, 'Регистрация');
+            
+            res.json({
+                success: true,
+                user: {
+                    id: newUser.id,
+                    username: displayName,
+                    avatar: userAvatar,
+                    balance: 0,
+                    level: 1,
+                    ads: 0,
+                    totalViews: 0
+                },
+                blocks: {}
+            });
         }
-    });
+    } catch (error) {
+        console.error('❌ Ошибка:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
 
-app.post('/api/save', (req, res) => {
+// 2. Сохранение прогресса
+app.post('/api/save', async (req, res) => {
     const { userId, user, blocks } = req.body;
+    
+    console.log(`💾 POST /api/save для ${userId}, баланс: ${user?.balance}`);
     
     if (!userId) {
         return res.status(400).json({ error: 'userId required' });
     }
     
-    db.run(
-        `UPDATE users SET 
-            balance = ?, 
-            level = ?, 
-            ads = ?,
-            total_views = total_views + ?,
-            last_active = unixepoch()
-        WHERE id = ?`,
-        [user.balance, user.level, user.ads, 1, userId],
-        (err) => {
-            if (err) {
-                console.error('❌ Ошибка сохранения пользователя:', err);
-                return res.status(500).json({ error: err.message });
+    try {
+        // Обновляем пользователя
+        const updateResult = await usersCollection.updateOne(
+            { id: userId },
+            {
+                $set: {
+                    balance: user.balance,
+                    level: user.level,
+                    ads: user.ads,
+                    last_active: Date.now()
+                },
+                $inc: { total_views: 1 }
             }
-            
-            const promises = [];
-            for (const [blockId, blockData] of Object.entries(blocks)) {
-                promises.push(new Promise((resolve, reject) => {
-                    db.run(
-                        'UPDATE user_blocks SET views = ?, locked_until = ? WHERE user_id = ? AND block_id = ?',
-                        [blockData.v, blockData.l, userId, blockId],
-                        (err) => {
-                            if (err) reject(err);
-                            else resolve();
-                        }
-                    );
-                }));
-            }
-            
-            Promise.all(promises)
-                .then(() => {
-                    console.log(`💾 Прогресс сохранён: ${userId}, баланс: ${user.balance}`);
-                    res.json({ success: true });
-                })
-                .catch(err => {
-                    console.error('❌ Ошибка сохранения блоков:', err);
-                    res.status(500).json({ error: err.message });
-                });
-        }
-    );
-});
-
-app.get('/api/leaderboard', (req, res) => {
-    db.all(
-        `SELECT id, username, avatar, balance, level, total_views 
-         FROM users 
-         ORDER BY balance DESC 
-         LIMIT 50`,
-        (err, rows) => {
-            if (err) {
-                console.error('❌ Ошибка лидерборда:', err);
-                return res.status(500).json({ error: err.message });
-            }
-            console.log(`📊 Лидерборд: ${rows.length} игроков`);
-            res.json(rows);
-        }
-    );
-});
-
-app.get('/api/stats', (req, res) => {
-    db.get(
-        `SELECT 
-            COUNT(*) as totalUsers,
-            SUM(balance) as totalBalance,
-            AVG(level) as avgLevel,
-            SUM(total_views) as totalViews
-         FROM users`,
-        (err, row) => {
-            if (err) {
-                console.error('❌ Ошибка статистики:', err);
-                return res.status(500).json({ error: err.message });
-            }
-            res.json({
-                totalUsers: row.totalUsers || 0,
-                totalBalance: row.totalBalance || 0,
-                avgLevel: Math.round((row.avgLevel || 1) * 10) / 10,
-                totalViews: row.totalViews || 0
-            });
-        }
-    );
-});
-
-app.get('/api/user/:id', (req, res) => {
-    const { id } = req.params;
-    
-    db.get('SELECT * FROM users WHERE id = ?', [id], (err, user) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-        if (!user) {
+        );
+        
+        if (updateResult.matchedCount === 0) {
+            console.log(`⚠️ Пользователь не найден: ${userId}`);
             return res.status(404).json({ error: 'User not found' });
         }
-        db.all('SELECT block_id, views, locked_until FROM user_blocks WHERE user_id = ?', [id], (err, blocks) => {
-            const blocksData = {};
-            blocks.forEach(b => {
-                blocksData[b.block_id] = { v: b.views, l: b.locked_until };
-            });
-            res.json({ user, blocks: blocksData });
-        });
-    });
-});
-
-app.get('/api/referrals/:id', (req, res) => {
-    const { id } = req.params;
-    db.all(
-        `SELECT r.*, u.username, u.avatar, u.level 
-         FROM referrals r 
-         JOIN users u ON r.referred_id = u.id 
-         WHERE r.referrer_id = ? 
-         ORDER BY r.created_at DESC`,
-        [id],
-        (err, rows) => {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json(rows);
+        
+        // Обновляем блоки
+        for (const [blockId, blockData] of Object.entries(blocks)) {
+            await blocksCollection.updateOne(
+                { user_id: userId, block_id: parseInt(blockId) },
+                {
+                    $set: {
+                        views: blockData.v,
+                        locked_until: blockData.l
+                    }
+                }
+            );
         }
-    );
+        
+        console.log(`✅ Прогресс сохранён: ${userId}, баланс: ${user.balance}`);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('❌ Ошибка сохранения:', error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
-app.get('/api/transactions/:id', (req, res) => {
-    const { id } = req.params;
-    const limit = req.query.limit || 50;
-    db.all(
-        'SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
-        [id, limit],
-        (err, rows) => {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json(rows);
-        }
-    );
+// 3. Лидерборд
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        const users = await usersCollection
+            .find({})
+            .sort({ balance: -1 })
+            .limit(50)
+            .project({ id: 1, username: 1, avatar: 1, balance: 1, level: 1 })
+            .toArray();
+        
+        res.json(users);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
-app.post('/api/reset/:id', (req, res) => {
-    const { id } = req.params;
-    db.run('UPDATE users SET balance = 0, level = 1, ads = 0, total_views = 0 WHERE id = ?', [id], (err) => {
-        if (err) return res.status(500).json({ error: err.message });
-        db.run('UPDATE user_blocks SET views = 0, locked_until = 0 WHERE user_id = ?', [id], (err) => {
-            if (err) return res.status(500).json({ error: err.message });
-            logTransaction(id, 'reset', 0, 'Сброс прогресса');
-            res.json({ success: true, message: 'Progress reset' });
-        });
-    });
+// 4. Статистика
+app.get('/api/stats', async (req, res) => {
+    try {
+        const totalUsers = await usersCollection.countDocuments();
+        res.json({ totalUsers });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), uptime: process.uptime() });
+// 5. Health check
+app.get('/health', async (req, res) => {
+    try {
+        await usersCollection.findOne({});
+        res.json({ status: 'ok', timestamp: new Date().toISOString(), database: 'mongodb' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', error: error.message });
+    }
 });
 
-// ============= ГЛАВНЫЙ МАРШРУТ =============
+// 6. Корневой маршрут
 app.get('/', (req, res) => {
-    const indexPath = path.join(rootPath, 'index.html');
-    console.log('📄 Отдаём index.html из:', indexPath);
-    res.sendFile(indexPath);
+    res.sendFile(path.join(rootPath, 'index.html'));
 });
 
 app.get('*', (req, res) => {
-    const indexPath = path.join(rootPath, 'index.html');
-    res.sendFile(indexPath);
+    res.sendFile(path.join(rootPath, 'index.html'));
 });
 
-app.use((err, req, res, next) => {
-    console.error('❌ Ошибка сервера:', err);
-    res.status(500).json({ error: 'Internal server error' });
-});
+// ============= ЗАПУСК СЕРВЕРА =============
+async function startServer() {
+    console.log('🔄 Запуск сервера...');
+    console.log('📁 Корневая папка:', rootPath);
+    
+    const dbConnected = await connectDB();
+    
+    if (!dbConnected) {
+        console.error('❌ MongoDB не подключена! Использую режим без БД (только для теста)');
+        // Создаём заглушки
+        db = { command: async () => {} };
+        usersCollection = { findOne: async () => null, updateOne: async () => {}, insertOne: async () => {}, countDocuments: async () => 0 };
+        blocksCollection = { find: async () => ({ toArray: async () => [] }), updateOne: async () => {}, insertOne: async () => {} };
+        referralsCollection = { insertOne: async () => {} };
+        transactionsCollection = { insertOne: async () => {} };
+    }
+    
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`🚀 Сервер запущен на порту ${PORT}`);
+        console.log(`   API: http://localhost:${PORT}/api`);
+        console.log(`   Health: http://localhost:${PORT}/health`);
+    });
+}
 
-// ============= ЗАПУСК =============
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`
-╔══════════════════════════════════════════════════════════╗
-║                     🚀 СЕРВЕР ЗАПУЩЕН                      ║
-╠══════════════════════════════════════════════════════════╣
-║  Порт: ${PORT}                                              
-║  API:  http://localhost:${PORT}/api                        
-║  Health: http://localhost:${PORT}/health                   
-╠══════════════════════════════════════════════════════════╣
-║  ✅ База данных SQLite подключена                          
-║  ✅ CORS разрешён для всех                                 
-║  ✅ Статика из папки: ${rootPath}                          
-╚══════════════════════════════════════════════════════════╝
-    `);
-});
+startServer();
