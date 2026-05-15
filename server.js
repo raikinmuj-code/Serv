@@ -12,16 +12,15 @@ app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ============= ПУТИ ДЛЯ СТАТИКИ =============
+// ============= СТАТИКА =============
 const rootPath = path.join(__dirname, '..');
 app.use(express.static(rootPath));
 
-// ============= ПОДКЛЮЧЕНИЕ К MONGODB =============
-// Пробуем разные возможные переменные окружения
-const MONGODB_URI = process.env.MONGODB_URI || process.env.MONGO_URL || process.env.DATABASE_URL || 'mongodb://localhost:27017';
+// ============= MONGODB =============
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017';
 const DB_NAME = process.env.DB_NAME || 'duckads';
 
-console.log('🔍 Переменные окружения:');
+console.log('🔍 Переменные:');
 console.log('   MONGODB_URI:', MONGODB_URI ? '✅ задана' : '❌ не задана');
 console.log('   DB_NAME:', DB_NAME);
 
@@ -33,8 +32,7 @@ let transactionsCollection;
 
 async function connectDB() {
     try {
-        console.log('🔄 Подключение к MongoDB...');
-        console.log('   URI:', MONGODB_URI.replace(/:[^:]*@/, ':****@')); // Скрываем пароль
+        console.log('🔄 Подключение к MongoDB (Railway)...');
         
         const client = new MongoClient(MONGODB_URI, {
             connectTimeoutMS: 10000,
@@ -42,7 +40,7 @@ async function connectDB() {
         });
         
         await client.connect();
-        console.log('✅ Подключено к MongoDB');
+        console.log('✅ MongoDB подключена!');
         
         db = client.db(DB_NAME);
         usersCollection = db.collection('users');
@@ -51,29 +49,28 @@ async function connectDB() {
         transactionsCollection = db.collection('transactions');
         
         // Создаём индексы
-        await usersCollection.createIndex({ id: 1 }, { unique: true });
-        await usersCollection.createIndex({ telegram_id: 1 });
-        await usersCollection.createIndex({ balance: -1 });
-        await blocksCollection.createIndex({ user_id: 1, block_id: 1 }, { unique: true });
-        await referralsCollection.createIndex({ referrer_id: 1 });
-        await transactionsCollection.createIndex({ user_id: 1 });
-        await transactionsCollection.createIndex({ created_at: -1 });
+        try {
+            await usersCollection.createIndex({ id: 1 }, { unique: true });
+            await usersCollection.createIndex({ telegram_id: 1 });
+            await usersCollection.createIndex({ balance: -1 });
+            await blocksCollection.createIndex({ user_id: 1, block_id: 1 }, { unique: true });
+            await transactionsCollection.createIndex({ user_id: 1 });
+            await transactionsCollection.createIndex({ created_at: -1 });
+            console.log('✅ Индексы созданы');
+        } catch (indexError) {
+            console.log('⚠️ Индексы уже существуют или ошибка:', indexError.message);
+        }
         
-        console.log('✅ Индексы созданы');
-        
-        // Проверяем, есть ли данные
         const userCount = await usersCollection.countDocuments();
-        console.log(`📊 В базе уже ${userCount} пользователей`);
+        console.log(`📊 Пользователей в базе: ${userCount}`);
         
         return true;
     } catch (error) {
-        console.error('❌ Ошибка подключения к MongoDB:', error.message);
-        console.error('   Полная ошибка:', error);
+        console.error('❌ Ошибка MongoDB:', error.message);
         return false;
     }
 }
 
-// ============= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =============
 function generateUsername() {
     const names = ['CryptoMaster', 'AdKing', 'TokenHunter', 'RewardSeeker', 'LevelUp', 'Miner', 'EagleEye', 'FastClick', 'GoldRush', 'CoinCollector'];
     return names[Math.floor(Math.random() * names.length)] + Math.floor(Math.random() * 1000);
@@ -89,40 +86,24 @@ async function logTransaction(userId, type, amount, description) {
             created_at: Date.now()
         });
     } catch (error) {
-        console.error('Ошибка записи транзакции:', error);
+        console.error('Ошибка транзакции:', error);
     }
 }
 
-// ============= API ENDPOINTS =============
+// ============= API =============
 
-// 1. Регистрация/получение пользователя
 app.post('/api/user', async (req, res) => {
-    console.log('📌 POST /api/user', req.body);
-    
-    const { 
-        userId, 
-        username, 
-        firstName, 
-        lastName, 
-        avatar, 
-        languageCode, 
-        isPremium,
-        referrerId 
-    } = req.body;
-    
+    const { userId, username, firstName, lastName, avatar, languageCode, isPremium, referrerId } = req.body;
     const id = userId || `tg_${uuidv4()}`;
     const displayName = username || firstName || generateUsername();
     const userAvatar = avatar || `https://i.pravatar.cc/100?img=${Math.floor(Math.random() * 70)}`;
     
-    console.log(`👤 Пользователь: ${id}, Имя: ${displayName}`);
+    console.log(`📌 Запрос: ${id}, Имя: ${displayName}`);
     
     try {
         let user = await usersCollection.findOne({ id });
         
         if (user) {
-            console.log(`✅ Существующий пользователь: ${displayName}`);
-            
-            // Обновляем активность
             await usersCollection.updateOne(
                 { id },
                 { 
@@ -136,12 +117,13 @@ app.post('/api/user', async (req, res) => {
                 }
             );
             
-            // Получаем блоки
             const blocks = await blocksCollection.find({ user_id: id }).toArray();
             const blocksData = {};
             blocks.forEach(b => {
                 blocksData[b.block_id] = { v: b.views, l: b.locked_until };
             });
+            
+            console.log(`✅ Пользователь загружен: ${displayName}`);
             
             res.json({
                 success: true,
@@ -157,9 +139,6 @@ app.post('/api/user', async (req, res) => {
                 blocks: blocksData
             });
         } else {
-            console.log(`🆕 Новый пользователь: ${displayName}`);
-            
-            // Создаём нового пользователя
             const newUser = {
                 id,
                 username: displayName,
@@ -178,7 +157,6 @@ app.post('/api/user', async (req, res) => {
             
             await usersCollection.insertOne(newUser);
             
-            // Создаём 3 блока
             for (let i = 1; i <= 3; i++) {
                 await blocksCollection.insertOne({
                     user_id: id,
@@ -188,7 +166,6 @@ app.post('/api/user', async (req, res) => {
                 });
             }
             
-            // Реферальный бонус
             if (referrerId && referrerId !== id) {
                 const bonusAmount = 0.01;
                 await usersCollection.updateOne(
@@ -208,6 +185,7 @@ app.post('/api/user', async (req, res) => {
             }
             
             await logTransaction(id, 'registration', 0, 'Регистрация');
+            console.log(`🆕 Новый пользователь: ${displayName}`);
             
             res.json({
                 success: true,
@@ -229,19 +207,15 @@ app.post('/api/user', async (req, res) => {
     }
 });
 
-// 2. Сохранение прогресса
 app.post('/api/save', async (req, res) => {
     const { userId, user, blocks } = req.body;
-    
-    console.log(`💾 POST /api/save для ${userId}, баланс: ${user?.balance}`);
     
     if (!userId) {
         return res.status(400).json({ error: 'userId required' });
     }
     
     try {
-        // Обновляем пользователя
-        const updateResult = await usersCollection.updateOne(
+        await usersCollection.updateOne(
             { id: userId },
             {
                 $set: {
@@ -254,12 +228,6 @@ app.post('/api/save', async (req, res) => {
             }
         );
         
-        if (updateResult.matchedCount === 0) {
-            console.log(`⚠️ Пользователь не найден: ${userId}`);
-            return res.status(404).json({ error: 'User not found' });
-        }
-        
-        // Обновляем блоки
         for (const [blockId, blockData] of Object.entries(blocks)) {
             await blocksCollection.updateOne(
                 { user_id: userId, block_id: parseInt(blockId) },
@@ -272,7 +240,7 @@ app.post('/api/save', async (req, res) => {
             );
         }
         
-        console.log(`✅ Прогресс сохранён: ${userId}, баланс: ${user.balance}`);
+        console.log(`💾 Сохранено: ${userId}, баланс: ${user.balance}`);
         res.json({ success: true });
     } catch (error) {
         console.error('❌ Ошибка сохранения:', error);
@@ -280,43 +248,128 @@ app.post('/api/save', async (req, res) => {
     }
 });
 
-// 3. Лидерборд
 app.get('/api/leaderboard', async (req, res) => {
     try {
         const users = await usersCollection
             .find({})
             .sort({ balance: -1 })
             .limit(50)
-            .project({ id: 1, username: 1, avatar: 1, balance: 1, level: 1 })
+            .project({ id: 1, username: 1, avatar: 1, balance: 1, level: 1, total_views: 1 })
             .toArray();
         
+        console.log(`📊 Лидерборд: ${users.length} игроков`);
         res.json(users);
     } catch (error) {
+        console.error('❌ Ошибка лидерборда:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 4. Статистика
 app.get('/api/stats', async (req, res) => {
     try {
         const totalUsers = await usersCollection.countDocuments();
-        res.json({ totalUsers });
+        const totalBalanceResult = await usersCollection.aggregate([
+            { $group: { _id: null, total: { $sum: '$balance' } } }
+        ]).toArray();
+        
+        res.json({
+            totalUsers,
+            totalBalance: totalBalanceResult[0]?.total || 0
+        });
+    } catch (error) {
+        console.error('❌ Ошибка статистики:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/user/:id', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const user = await usersCollection.findOne({ id });
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        const blocks = await blocksCollection.find({ user_id: id }).toArray();
+        const blocksData = {};
+        blocks.forEach(b => {
+            blocksData[b.block_id] = { v: b.views, l: b.locked_until };
+        });
+        
+        res.json({ user, blocks: blocksData });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-// 5. Health check
+app.get('/api/referrals/:id', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const referrals = await referralsCollection
+            .find({ referrer_id: id })
+            .sort({ created_at: -1 })
+            .toArray();
+        
+        res.json(referrals);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/transactions/:id', async (req, res) => {
+    const { id } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+    
+    try {
+        const transactions = await transactionsCollection
+            .find({ user_id: id })
+            .sort({ created_at: -1 })
+            .limit(limit)
+            .toArray();
+        
+        res.json(transactions);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/reset/:id', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        await usersCollection.updateOne(
+            { id },
+            { $set: { balance: 0, level: 1, ads: 0, total_views: 0 } }
+        );
+        
+        await blocksCollection.updateMany(
+            { user_id: id },
+            { $set: { views: 0, locked_until: 0 } }
+        );
+        
+        await logTransaction(id, 'reset', 0, 'Сброс прогресса');
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/health', async (req, res) => {
     try {
         await usersCollection.findOne({});
-        res.json({ status: 'ok', timestamp: new Date().toISOString(), database: 'mongodb' });
+        res.json({ 
+            status: 'ok', 
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            database: 'mongodb-railway'
+        });
     } catch (error) {
         res.status(500).json({ status: 'error', error: error.message });
     }
 });
 
-// 6. Корневой маршрут
 app.get('/', (req, res) => {
     res.sendFile(path.join(rootPath, 'index.html'));
 });
@@ -325,7 +378,7 @@ app.get('*', (req, res) => {
     res.sendFile(path.join(rootPath, 'index.html'));
 });
 
-// ============= ЗАПУСК СЕРВЕРА =============
+// ============= ЗАПУСК =============
 async function startServer() {
     console.log('🔄 Запуск сервера...');
     console.log('📁 Корневая папка:', rootPath);
@@ -333,19 +386,24 @@ async function startServer() {
     const dbConnected = await connectDB();
     
     if (!dbConnected) {
-        console.error('❌ MongoDB не подключена! Использую режим без БД (только для теста)');
-        // Создаём заглушки
-        db = { command: async () => {} };
-        usersCollection = { findOne: async () => null, updateOne: async () => {}, insertOne: async () => {}, countDocuments: async () => 0 };
-        blocksCollection = { find: async () => ({ toArray: async () => [] }), updateOne: async () => {}, insertOne: async () => {} };
-        referralsCollection = { insertOne: async () => {} };
-        transactionsCollection = { insertOne: async () => {} };
+        console.error('❌ MongoDB не подключена!');
+        process.exit(1);
     }
     
     app.listen(PORT, '0.0.0.0', () => {
-        console.log(`🚀 Сервер запущен на порту ${PORT}`);
-        console.log(`   API: http://localhost:${PORT}/api`);
-        console.log(`   Health: http://localhost:${PORT}/health`);
+        console.log(`
+╔══════════════════════════════════════════════════════════╗
+║                     🚀 СЕРВЕР ЗАПУЩЕН                      ║
+╠══════════════════════════════════════════════════════════╣
+║  Порт: ${PORT}                                              
+║  API:  http://localhost:${PORT}/api                        
+║  Health: http://localhost:${PORT}/health                   
+╠══════════════════════════════════════════════════════════╣
+║  ✅ MongoDB подключена                                     
+║  ✅ База данных: ${DB_NAME}                                
+║  ✅ CORS разрешён для всех                                 
+╚══════════════════════════════════════════════════════════╝
+        `);
     });
 }
 
