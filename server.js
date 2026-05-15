@@ -7,15 +7,19 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: '*' }));
-app.use(express.json());
-app.use(express.static(path.join(__dirname, '..')));
+app.use(cors({ origin: '*', credentials: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-// ============= ПРЯМОЕ ПОДКЛЮЧЕНИЕ =============
-const MONGO_URL = 'mongodb://mongo:MmFGAwrRIXPnPscZUhlXsMNZvHbGrPVs@yamanote.proxy.rlwy.net:55514';
+// ============= ПУТИ ДЛЯ СТАТИКИ =============
+const rootPath = path.join(__dirname, '..');
+app.use(express.static(rootPath));
+
+// ============= ПРЯМОЕ ПОДКЛЮЧЕНИЕ К MONGODB =============
+const MONGODB_URI = 'mongodb://mongo:MmFGAwrRIXPnPscZUhlXsMNZvHbGrPVs@yamanote.proxy.rlwy.net:55514';
 const DB_NAME = 'duckads';
 
-console.log('🔗 Подключаюсь к:', MONGO_URL.replace(/:[^:]*@/, ':****@'));
+console.log('🔗 Подключаюсь к MongoDB:', MONGODB_URI.replace(/:[^:]*@/, ':****@'));
 
 let db;
 let usersCollection;
@@ -23,7 +27,7 @@ let blocksCollection;
 
 async function connectDB() {
     try {
-        const client = new MongoClient(MONGO_URL);
+        const client = new MongoClient(MONGODB_URI);
         await client.connect();
         console.log('✅ MongoDB подключена!');
         
@@ -35,11 +39,11 @@ async function connectDB() {
         await blocksCollection.createIndex({ user_id: 1, block_id: 1 }, { unique: true });
         
         const count = await usersCollection.countDocuments();
-        console.log(`📊 Пользователей: ${count}`);
+        console.log(`📊 Пользователей в базе: ${count}`);
         
         return true;
     } catch (error) {
-        console.error('❌ Ошибка:', error.message);
+        console.error('❌ Ошибка MongoDB:', error.message);
         return false;
     }
 }
@@ -96,6 +100,7 @@ app.post('/api/user', async (req, res) => {
             });
         }
     } catch (error) {
+        console.error('Ошибка:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -116,8 +121,10 @@ app.post('/api/save', async (req, res) => {
             );
         }
         
+        console.log(`💾 Сохранено: ${userId}, баланс: ${user.balance}`);
         res.json({ success: true });
     } catch (error) {
+        console.error('Ошибка:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -137,18 +144,21 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, '..', 'index.html'));
+    res.sendFile(path.join(rootPath, 'index.html'));
 });
 
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '..', 'index.html'));
+    res.sendFile(path.join(rootPath, 'index.html'));
 });
 
+// ============= ЗАПУСК =============
 connectDB().then(() => {
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`🚀 Сервер на порту ${PORT}`);
+        console.log(`   API: http://localhost:${PORT}/api`);
+        console.log(`   Health: http://localhost:${PORT}/health`);
     });
 }).catch(err => {
-    console.error('❌ Ошибка:', err);
+    console.error('❌ Ошибка запуска:', err);
     process.exit(1);
 });
