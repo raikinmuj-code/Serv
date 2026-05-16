@@ -10,39 +10,30 @@ app.use(express.json());
 app.use(cors());
 app.use(express.static('.'));
 
-// НОВАЯ MongoDB строка подключения
+// MongoDB подключение
 const MONGODB_URI = 'mongodb://mongo:HifCudFNbVfxsoSXpdXnNSXhWPfeDpLQ@shinkansen.proxy.rlwy.net:44359';
 const DB_NAME = 'duckads';
 
 let db;
 let usersCollection;
 
+// Подключение к MongoDB
 async function connectDB() {
     try {
-        const client = new MongoClient(MONGODB_URI, {
-            maxPoolSize: 10,
-            connectTimeoutMS: 10000,
-            socketTimeoutMS: 45000
-        });
-        
+        const client = new MongoClient(MONGODB_URI);
         await client.connect();
-        console.log('✅ Подключено к новой MongoDB');
+        console.log('✅ MongoDB подключена');
         
         db = client.db(DB_NAME);
         usersCollection = db.collection('users');
         
-        // Создаем индексы
+        // Индексы для скорости
         await usersCollection.createIndex({ id: 1 }, { unique: true });
         await usersCollection.createIndex({ token: 1 });
-        await usersCollection.createIndex({ balance: -1 });
-        
-        // Проверяем статус
-        const stats = await db.stats();
-        console.log(`📊 Размер БД: ${(stats.dataSize / 1024 / 1024).toFixed(2)} MB`);
         
         return true;
     } catch (error) {
-        console.error('❌ Ошибка подключения к MongoDB:', error.message);
+        console.error('❌ Ошибка MongoDB:', error.message);
         return false;
     }
 }
@@ -51,30 +42,33 @@ function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
 
+// Middleware
 async function authMiddleware(req, res, next) {
     const token = req.headers['authorization'];
     if (!token) {
-        return res.status(401).json({ error: 'No token provided' });
+        return res.status(401).json({ error: 'Нет токена' });
     }
     
     try {
         const user = await usersCollection.findOne({ token: token });
         if (!user) {
-            return res.status(401).json({ error: 'Invalid token' });
+            return res.status(401).json({ error: 'Неверный токен' });
         }
         req.user = user;
         next();
     } catch (error) {
-        res.status(500).json({ error: 'Database error' });
+        res.status(500).json({ error: 'Ошибка БД' });
     }
 }
 
-// Регистрация пользователя
+// ==================== API ====================
+
+// Авторизация
 app.post('/api/auth', async (req, res) => {
     const { telegramId, name, avatar, referrerId } = req.body;
     
     if (!telegramId) {
-        return res.status(400).json({ error: 'telegramId required' });
+        return res.status(400).json({ error: 'telegramId обязателен' });
     }
     
     try {
@@ -95,8 +89,6 @@ app.post('/api/auth', async (req, res) => {
                 referrerId: referrerId || null,
                 token: generateToken(),
                 createdAt: new Date(),
-                lastSeen: new Date(),
-                totalWatched: 0,
                 adsBlocks: [
                     { id: 0, watched: 0, maxWatches: 15, rewardPerView: 0.0009 },
                     { id: 1, watched: 0, maxWatches: 15, rewardPerView: 0.0009 },
@@ -108,31 +100,17 @@ app.post('/api/auth', async (req, res) => {
             await usersCollection.insertOne(newUser);
             user = newUser;
             
-            // Награда за реферала
+            // Награда рефереру
             if (referrerId) {
-                try {
-                    await usersCollection.updateOne(
-                        { id: referrerId },
-                        { 
-                            $inc: { balance: 0.50 },
-                            $push: { referrals: telegramId }
-                        }
-                    );
-                } catch (refError) {
-                    console.error('Referral error:', refError);
-                }
+                await usersCollection.updateOne(
+                    { id: referrerId },
+                    { $inc: { balance: 0.50 }, $push: { referrals: telegramId } }
+                );
             }
         } else {
             await usersCollection.updateOne(
                 { id: telegramId },
-                { 
-                    $set: { 
-                        name: name || user.name,
-                        avatar: avatar || user.avatar,
-                        lastSeen: new Date(),
-                        token: generateToken()
-                    }
-                }
+                { $set: { token: generateToken(), lastSeen: new Date() } }
             );
             user = await usersCollection.findOne({ id: telegramId });
         }
@@ -143,44 +121,34 @@ app.post('/api/auth', async (req, res) => {
             user: {
                 id: user.id,
                 name: user.name,
-                avatar: user.avatar,
                 balance: user.balance,
                 level: user.level,
                 xp: user.xp,
                 boostDouble: user.boostDouble,
                 boostDoubleEnd: user.boostDoubleEnd,
                 completedTasks: user.completedTasks || [],
-                referrerId: user.referrerId,
                 adsBlocks: user.adsBlocks,
                 autoMode: user.autoMode
             }
         });
     } catch (error) {
         console.error('Auth error:', error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: 'Ошибка сервера' });
     }
 });
 
-// Получение данных пользователя
+// Получение данных
 app.get('/api/user', authMiddleware, async (req, res) => {
-    try {
-        res.json({
-            id: req.user.id,
-            name: req.user.name,
-            avatar: req.user.avatar,
-            balance: req.user.balance,
-            level: req.user.level,
-            xp: req.user.xp,
-            boostDouble: req.user.boostDouble,
-            boostDoubleEnd: req.user.boostDoubleEnd,
-            completedTasks: req.user.completedTasks || [],
-            referrerId: req.user.referrerId,
-            adsBlocks: req.user.adsBlocks,
-            autoMode: req.user.autoMode
-        });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
+    res.json({
+        balance: req.user.balance,
+        level: req.user.level,
+        xp: req.user.xp,
+        boostDouble: req.user.boostDouble,
+        boostDoubleEnd: req.user.boostDoubleEnd,
+        completedTasks: req.user.completedTasks || [],
+        adsBlocks: req.user.adsBlocks,
+        autoMode: req.user.autoMode
+    });
 });
 
 // Сохранение прогресса
@@ -197,7 +165,6 @@ app.post('/api/save', authMiddleware, async (req, res) => {
         if (completedTasks !== undefined) updateData.completedTasks = completedTasks;
         if (adsBlocks !== undefined) updateData.adsBlocks = adsBlocks;
         if (autoMode !== undefined) updateData.autoMode = autoMode;
-        updateData.lastSeen = new Date();
         
         await usersCollection.updateOne(
             { id: req.user.id },
@@ -206,33 +173,7 @@ app.post('/api/save', authMiddleware, async (req, res) => {
         
         res.json({ success: true });
     } catch (error) {
-        console.error('Save error:', error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Добавление реферала
-app.post('/api/addReferral', authMiddleware, async (req, res) => {
-    const { referrerId } = req.body;
-    
-    try {
-        if (referrerId && referrerId !== req.user.id && !req.user.referrerId) {
-            await usersCollection.updateOne(
-                { id: req.user.id },
-                { $set: { referrerId: referrerId } }
-            );
-            
-            await usersCollection.updateOne(
-                { id: referrerId },
-                { 
-                    $inc: { balance: 0.50 },
-                    $push: { referrals: req.user.id }
-                }
-            );
-        }
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: 'Ошибка сохранения' });
     }
 });
 
@@ -243,12 +184,11 @@ app.get('/api/leaderboard', async (req, res) => {
             .find({})
             .sort({ balance: -1 })
             .limit(50)
-            .project({ name: 1, balance: 1, level: 1, avatar: 1 })
+            .project({ name: 1, balance: 1, level: 1 })
             .toArray();
-        
         res.json(leaders);
     } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: 'Ошибка' });
     }
 });
 
@@ -256,21 +196,19 @@ app.get('/api/leaderboard', async (req, res) => {
 app.get('/api/stats', async (req, res) => {
     try {
         const totalUsers = await usersCollection.countDocuments();
-        const totalBalanceResult = await usersCollection.aggregate([
+        const totalBalance = await usersCollection.aggregate([
             { $group: { _id: null, total: { $sum: '$balance' } } }
         ]).toArray();
-        const totalBalance = totalBalanceResult[0]?.total || 0;
-        
-        res.json({
-            totalUsers,
-            totalBalance: totalBalance.toFixed(2)
+        res.json({ 
+            totalUsers, 
+            totalBalance: totalBalance[0]?.total.toFixed(2) || 0 
         });
     } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+        res.json({ totalUsers: 0, totalBalance: 0 });
     }
 });
 
-// Обновление просмотров
+// Добавление просмотра
 app.post('/api/addWatch', authMiddleware, async (req, res) => {
     try {
         await usersCollection.updateOne(
@@ -279,27 +217,24 @@ app.post('/api/addWatch', authMiddleware, async (req, res) => {
         );
         res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: 'Ошибка' });
     }
 });
 
 // Проверка здоровья
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date() });
+    res.json({ status: 'ok' });
 });
 
 // Запуск
 async function startServer() {
     const dbConnected = await connectDB();
-    
     if (!dbConnected) {
-        console.error('❌ Не удалось подключиться к MongoDB');
         process.exit(1);
     }
     
     app.listen(PORT, () => {
-        console.log(`🚀 Сервер запущен на порту ${PORT}`);
-        console.log(`🗄️  Новая MongoDB подключена`);
+        console.log(`🚀 Сервер на порту ${PORT}`);
     });
 }
 

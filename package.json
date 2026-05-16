@@ -1,7 +1,6 @@
 {
   "name": "duck-ads",
   "version": "1.0.0",
-  "description": "Duck Ads with MongoDB",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
