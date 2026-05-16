@@ -1,12 +1,11 @@
 const express = require('express');
-const { MongoClient, ObjectId } = require('mongodb');
+const { MongoClient } = require('mongodb');
 const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(express.json());
 app.use(cors());
 app.use(express.static('.'));
@@ -23,7 +22,12 @@ let transactionsCollection;
 // Подключение к MongoDB
 async function connectDB() {
     try {
-        const client = new MongoClient(MONGODB_URI);
+        const client = new MongoClient(MONGODB_URI, {
+            maxPoolSize: 10,
+            connectTimeoutMS: 10000,
+            socketTimeoutMS: 45000
+        });
+        
         await client.connect();
         console.log('✅ Подключено к MongoDB');
         
@@ -37,14 +41,13 @@ async function connectDB() {
         await usersCollection.createIndex({ token: 1 });
         await usersCollection.createIndex({ balance: -1 });
         
-        console.log('📊 Индексы созданы');
+        return true;
     } catch (error) {
-        console.error('❌ Ошибка подключения к MongoDB:', error);
-        process.exit(1);
+        console.error('❌ Ошибка подключения к MongoDB:', error.message);
+        return false;
     }
 }
 
-// Генерация токена
 function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
@@ -56,13 +59,16 @@ async function authMiddleware(req, res, next) {
         return res.status(401).json({ error: 'No token provided' });
     }
     
-    const user = await usersCollection.findOne({ token: token });
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid token' });
+    try {
+        const user = await usersCollection.findOne({ token: token });
+        if (!user) {
+            return res.status(401).json({ error: 'Invalid token' });
+        }
+        req.user = user;
+        next();
+    } catch (error) {
+        res.status(500).json({ error: 'Database error' });
     }
-    
-    req.user = user;
-    next();
 }
 
 // ==================== API РОУТЫ ====================
@@ -79,7 +85,6 @@ app.post('/api/auth', async (req, res) => {
         let user = await usersCollection.findOne({ id: telegramId });
         
         if (!user) {
-            // Создание нового пользователя
             const newUser = {
                 id: telegramId,
                 name: name || 'User',
@@ -95,16 +100,21 @@ app.post('/api/auth', async (req, res) => {
                 token: generateToken(),
                 createdAt: new Date(),
                 lastSeen: new Date(),
-                totalWatched: 0
+                totalWatched: 0,
+                adsBlocks: [
+                    { id: 0, watched: 0, maxWatches: 15, rewardPerView: 0.0009 },
+                    { id: 1, watched: 0, maxWatches: 15, rewardPerView: 0.0009 },
+                    { id: 2, watched: 0, maxWatches: 15, rewardPerView: 0.0009 }
+                ],
+                autoMode: true
             };
             
-            const result = await usersCollection.insertOne(newUser);
+            await usersCollection.insertOne(newUser);
             user = newUser;
             
             // Награда за реферала
             if (referrerId) {
-                const referrer = await usersCollection.findOne({ id: referrerId });
-                if (referrer) {
+                try {
                     await usersCollection.updateOne(
                         { id: referrerId },
                         { 
@@ -112,10 +122,11 @@ app.post('/api/auth', async (req, res) => {
                             $push: { referrals: telegramId }
                         }
                     );
+                } catch (refError) {
+                    console.error('Referral error:', refError);
                 }
             }
         } else {
-            // Обновление существующего пользователя
             await usersCollection.updateOne(
                 { id: telegramId },
                 { 
@@ -143,7 +154,9 @@ app.post('/api/auth', async (req, res) => {
                 boostDouble: user.boostDouble,
                 boostDoubleEnd: user.boostDoubleEnd,
                 completedTasks: user.completedTasks || [],
-                referrerId: user.referrerId
+                referrerId: user.referrerId,
+                adsBlocks: user.adsBlocks,
+                autoMode: user.autoMode
             }
         });
     } catch (error) {
@@ -166,14 +179,16 @@ app.get('/api/user', authMiddleware, async (req, res) => {
             boostDoubleEnd: req.user.boostDoubleEnd,
             completedTasks: req.user.completedTasks || [],
             referrerId: req.user.referrerId,
-            totalWatched: req.user.totalWatched || 0
+            totalWatched: req.user.totalWatched || 0,
+            adsBlocks: req.user.adsBlocks,
+            autoMode: req.user.autoMode
         });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Сохранение прогресса
+// Сохранение прогресса (только на сервер)
 app.post('/api/save', authMiddleware, async (req, res) => {
     const { balance, level, xp, boostDouble, boostDoubleEnd, completedTasks, adsBlocks, autoMode } = req.body;
     
@@ -185,6 +200,7 @@ app.post('/api/save', authMiddleware, async (req, res) => {
         if (boostDouble !== undefined) updateData.boostDouble = boostDouble;
         if (boostDoubleEnd !== undefined) updateData.boostDoubleEnd = boostDoubleEnd;
         if (completedTasks !== undefined) updateData.completedTasks = completedTasks;
+        if (adsBlocks !== undefined) updateData.adsBlocks = adsBlocks;
         if (autoMode !== undefined) updateData.autoMode = autoMode;
         updateData.lastSeen = new Date();
         
@@ -192,15 +208,6 @@ app.post('/api/save', authMiddleware, async (req, res) => {
             { id: req.user.id },
             { $set: updateData }
         );
-        
-        // Сохраняем рекламные блоки отдельно
-        if (adsBlocks) {
-            await adsCollection.updateOne(
-                { userId: req.user.id },
-                { $set: { blocks: adsBlocks, lastUpdate: new Date() } },
-                { upsert: true }
-            );
-        }
         
         res.json({ success: true });
     } catch (error) {
@@ -220,7 +227,6 @@ app.post('/api/addReferral', authMiddleware, async (req, res) => {
                 { $set: { referrerId: referrerId } }
             );
             
-            // Награда рефереру
             await usersCollection.updateOne(
                 { id: referrerId },
                 { 
@@ -231,26 +237,6 @@ app.post('/api/addReferral', authMiddleware, async (req, res) => {
         }
         
         res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Получение рекламных блоков пользователя
-app.get('/api/ads', authMiddleware, async (req, res) => {
-    try {
-        const adsData = await adsCollection.findOne({ userId: req.user.id });
-        if (adsData && adsData.blocks) {
-            res.json(adsData.blocks);
-        } else {
-            // Дефолтные блоки
-            const defaultBlocks = [
-                { id: 0, watched: 0, maxWatches: 15, rewardPerView: 0.0009 },
-                { id: 1, watched: 0, maxWatches: 15, rewardPerView: 0.0009 },
-                { id: 2, watched: 0, maxWatches: 15, rewardPerView: 0.0009 }
-            ];
-            res.json(defaultBlocks);
-        }
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
     }
@@ -281,48 +267,11 @@ app.get('/api/stats', async (req, res) => {
         ]).toArray();
         const totalBalance = totalBalanceResult[0]?.total || 0;
         
-        const totalWatchedResult = await usersCollection.aggregate([
-            { $group: { _id: null, total: { $sum: '$totalWatched' } } }
-        ]).toArray();
-        const totalWatched = totalWatchedResult[0]?.total || 0;
-        
         res.json({
             totalUsers,
             totalBalance: totalBalance.toFixed(2),
-            totalWatched
+            totalWatched: 0
         });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Создание транзакции (вывод средств)
-app.post('/api/withdraw', authMiddleware, async (req, res) => {
-    const { amount, wallet } = req.body;
-    
-    try {
-        if (req.user.balance < amount || amount < 1) {
-            return res.status(400).json({ error: 'Insufficient balance or invalid amount' });
-        }
-        
-        // Создаем запрос на вывод
-        const transaction = {
-            userId: req.user.id,
-            amount: amount,
-            wallet: wallet,
-            status: 'pending',
-            createdAt: new Date()
-        };
-        
-        await transactionsCollection.insertOne(transaction);
-        
-        // Резервируем средства
-        await usersCollection.updateOne(
-            { id: req.user.id },
-            { $inc: { balance: -amount } }
-        );
-        
-        res.json({ success: true, transactionId: transaction._id });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
     }
@@ -343,12 +292,16 @@ app.post('/api/addWatch', authMiddleware, async (req, res) => {
 
 // ==================== ЗАПУСК СЕРВЕРА ====================
 async function startServer() {
-    await connectDB();
+    const dbConnected = await connectDB();
+    
+    if (!dbConnected) {
+        console.error('❌ Невозможно продолжить без MongoDB');
+        process.exit(1);
+    }
     
     app.listen(PORT, () => {
         console.log(`🚀 Сервер запущен на порту ${PORT}`);
-        console.log(`📱 Откройте http://localhost:${PORT}`);
-        console.log(`🗄️  База данных: ${DB_NAME}`);
+        console.log(`🗄️  MongoDB подключена`);
     });
 }
 
