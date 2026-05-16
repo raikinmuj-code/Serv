@@ -85,7 +85,6 @@ const taskCompletionSchema = new mongoose.Schema({
     completedAt: { type: Date, default: Date.now }
 });
 
-// Compound index for unique task completions
 taskCompletionSchema.index({ userId: 1, taskId: 1 }, { unique: true });
 
 const User = mongoose.model('User', userSchema);
@@ -109,15 +108,11 @@ async function updateReferralReward(referrerId, newUserId) {
     
     try {
         const referrer = await User.findOne({ userId: referrerId });
-        if (referrer) {
-            // Add to referrals list if not already there
-            if (!referrer.referrals.includes(newUserId)) {
-                referrer.referrals.push(newUserId);
-                // Reward: 10% of start balance or fixed 0.01
-                referrer.balance += 0.01;
-                await referrer.save();
-                console.log(`💰 Referral reward: ${referrerId} +0.01 from ${newUserId}`);
-            }
+        if (referrer && !referrer.referrals.includes(newUserId)) {
+            referrer.referrals.push(newUserId);
+            referrer.balance += 0.01;
+            await referrer.save();
+            console.log(`💰 Referral reward: ${referrerId} +0.01 from ${newUserId}`);
         }
     } catch (error) {
         console.error('Error updating referral reward:', error);
@@ -130,6 +125,10 @@ async function updateReferralReward(referrerId, newUserId) {
 app.post('/api/user', async (req, res) => {
     try {
         const { userId, username, firstName, lastName, avatar, languageCode, isPremium, referrerId } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ success: false, error: 'userId is required' });
+        }
         
         let user = await User.findOne({ userId });
         
@@ -163,9 +162,6 @@ app.post('/api/user', async (req, res) => {
             console.log(`👤 User logged in: ${userId}`);
         }
         
-        // Get referrer count
-        const referrerCount = user.referrals ? user.referrals.length : 0;
-        
         res.json({
             success: true,
             user: {
@@ -179,7 +175,7 @@ app.post('/api/user', async (req, res) => {
             },
             blocks: user.blocks,
             boosts: user.boosts,
-            referrerCount
+            referrerCount: user.referrals ? user.referrals.length : 0
         });
         
     } catch (error) {
@@ -223,6 +219,10 @@ app.post('/api/save', async (req, res) => {
     try {
         const { userId, user: userData, blocks, boosts } = req.body;
         
+        if (!userId) {
+            return res.status(400).json({ success: false, error: 'userId is required' });
+        }
+        
         const user = await User.findOne({ userId });
         if (!user) {
             return res.status(404).json({ success: false, error: 'User not found' });
@@ -230,24 +230,24 @@ app.post('/api/save', async (req, res) => {
         
         // Update user data
         if (userData) {
-            user.balance = userData.balance;
-            user.level = userData.level;
-            user.ads = userData.ads;
+            if (typeof userData.balance !== 'undefined') user.balance = userData.balance;
+            if (typeof userData.level !== 'undefined') user.level = userData.level;
+            if (typeof userData.ads !== 'undefined') user.ads = userData.ads;
         }
         
         // Update blocks
         if (blocks) {
             for (const [blockId, blockData] of Object.entries(blocks)) {
                 if (user.blocks[blockId]) {
-                    user.blocks[blockId].v = blockData.v;
-                    user.blocks[blockId].l = blockData.l;
+                    if (typeof blockData.v !== 'undefined') user.blocks[blockId].v = blockData.v;
+                    if (typeof blockData.l !== 'undefined') user.blocks[blockId].l = blockData.l;
                 }
             }
         }
         
         // Update boosts
         if (boosts) {
-            user.boosts = boosts;
+            user.boosts = { ...user.boosts, ...boosts };
         }
         
         await user.save();
@@ -264,6 +264,10 @@ app.post('/api/save', async (req, res) => {
 app.post('/api/task', async (req, res) => {
     try {
         const { userId, taskId } = req.body;
+        
+        if (!userId || !taskId) {
+            return res.status(400).json({ success: false, error: 'userId and taskId are required' });
+        }
         
         // Check if task already completed
         const existingCompletion = await TaskCompletion.findOne({ userId, taskId });
@@ -298,6 +302,10 @@ app.post('/api/withdraw', async (req, res) => {
     try {
         const { userId, amount } = req.body;
         
+        if (!userId) {
+            return res.status(400).json({ success: false, error: 'userId is required' });
+        }
+        
         if (amount < 0.01) {
             return res.status(400).json({ success: false, error: 'Minimum withdrawal amount is $0.01' });
         }
@@ -318,7 +326,7 @@ app.post('/api/withdraw', async (req, res) => {
             status: 'pending'
         });
         
-        // Deduct balance (but keep record for processing)
+        // Deduct balance
         user.balance -= amount;
         await user.save();
         
@@ -444,9 +452,24 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// Serve static files
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        name: 'Duck Ads API',
+        version: '1.0.0',
+        endpoints: [
+            'POST /api/user',
+            'GET /api/user/:userId',
+            'POST /api/save',
+            'POST /api/task',
+            'POST /api/withdraw',
+            'GET /api/leaderboard',
+            'GET /api/referrals/:userId',
+            'GET /api/admin/withdrawals',
+            'POST /api/admin/withdrawals/:id/process',
+            'GET /api/health'
+        ]
+    });
 });
 
 // ============= START SERVER =============
@@ -454,4 +477,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`📊 API available at http://localhost:${PORT}/api`);
+    console.log(`💾 MongoDB: ${MONGODB_URI}`);
 });
