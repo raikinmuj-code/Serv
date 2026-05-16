@@ -10,16 +10,13 @@ app.use(express.json());
 app.use(cors());
 app.use(express.static('.'));
 
-// MongoDB connection
-const MONGODB_URI = 'mongodb://mongo:MmFGAwrRIXPnPscZUhlXsMNZvHbGrPVs@yamanote.proxy.rlwy.net:55514';
+// НОВАЯ MongoDB строка подключения
+const MONGODB_URI = 'mongodb://mongo:HifCudFNbVfxsoSXpdXnNSXhWPfeDpLQ@shinkansen.proxy.rlwy.net:44359';
 const DB_NAME = 'duckads';
 
 let db;
 let usersCollection;
-let adsCollection;
-let transactionsCollection;
 
-// Подключение к MongoDB
 async function connectDB() {
     try {
         const client = new MongoClient(MONGODB_URI, {
@@ -29,17 +26,19 @@ async function connectDB() {
         });
         
         await client.connect();
-        console.log('✅ Подключено к MongoDB');
+        console.log('✅ Подключено к новой MongoDB');
         
         db = client.db(DB_NAME);
         usersCollection = db.collection('users');
-        adsCollection = db.collection('ads_blocks');
-        transactionsCollection = db.collection('transactions');
         
         // Создаем индексы
         await usersCollection.createIndex({ id: 1 }, { unique: true });
         await usersCollection.createIndex({ token: 1 });
         await usersCollection.createIndex({ balance: -1 });
+        
+        // Проверяем статус
+        const stats = await db.stats();
+        console.log(`📊 Размер БД: ${(stats.dataSize / 1024 / 1024).toFixed(2)} MB`);
         
         return true;
     } catch (error) {
@@ -52,7 +51,6 @@ function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
 
-// Middleware для проверки токена
 async function authMiddleware(req, res, next) {
     const token = req.headers['authorization'];
     if (!token) {
@@ -71,9 +69,7 @@ async function authMiddleware(req, res, next) {
     }
 }
 
-// ==================== API РОУТЫ ====================
-
-// Регистрация/авторизация через Telegram
+// Регистрация пользователя
 app.post('/api/auth', async (req, res) => {
     const { telegramId, name, avatar, referrerId } = req.body;
     
@@ -179,7 +175,6 @@ app.get('/api/user', authMiddleware, async (req, res) => {
             boostDoubleEnd: req.user.boostDoubleEnd,
             completedTasks: req.user.completedTasks || [],
             referrerId: req.user.referrerId,
-            totalWatched: req.user.totalWatched || 0,
             adsBlocks: req.user.adsBlocks,
             autoMode: req.user.autoMode
         });
@@ -188,7 +183,7 @@ app.get('/api/user', authMiddleware, async (req, res) => {
     }
 });
 
-// Сохранение прогресса (только на сервер)
+// Сохранение прогресса
 app.post('/api/save', authMiddleware, async (req, res) => {
     const { balance, level, xp, boostDouble, boostDoubleEnd, completedTasks, adsBlocks, autoMode } = req.body;
     
@@ -235,14 +230,13 @@ app.post('/api/addReferral', authMiddleware, async (req, res) => {
                 }
             );
         }
-        
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Получение топа игроков
+// Топ игроков
 app.get('/api/leaderboard', async (req, res) => {
     try {
         const leaders = await usersCollection
@@ -258,7 +252,7 @@ app.get('/api/leaderboard', async (req, res) => {
     }
 });
 
-// Получение статистики
+// Статистика
 app.get('/api/stats', async (req, res) => {
     try {
         const totalUsers = await usersCollection.countDocuments();
@@ -269,8 +263,7 @@ app.get('/api/stats', async (req, res) => {
         
         res.json({
             totalUsers,
-            totalBalance: totalBalance.toFixed(2),
-            totalWatched: 0
+            totalBalance: totalBalance.toFixed(2)
         });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
@@ -290,18 +283,23 @@ app.post('/api/addWatch', authMiddleware, async (req, res) => {
     }
 });
 
-// ==================== ЗАПУСК СЕРВЕРА ====================
+// Проверка здоровья
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date() });
+});
+
+// Запуск
 async function startServer() {
     const dbConnected = await connectDB();
     
     if (!dbConnected) {
-        console.error('❌ Невозможно продолжить без MongoDB');
+        console.error('❌ Не удалось подключиться к MongoDB');
         process.exit(1);
     }
     
     app.listen(PORT, () => {
         console.log(`🚀 Сервер запущен на порту ${PORT}`);
-        console.log(`🗄️  MongoDB подключена`);
+        console.log(`🗄️  Новая MongoDB подключена`);
     });
 }
 
