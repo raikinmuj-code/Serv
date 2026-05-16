@@ -1,327 +1,355 @@
 const express = require('express');
-const mongoose = require('mongoose');
+const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
 app.use(express.json());
+app.use(cors());
+app.use(express.static('.'));
 
 // MongoDB connection
 const MONGODB_URI = 'mongodb://mongo:MmFGAwrRIXPnPscZUhlXsMNZvHbGrPVs@yamanote.proxy.rlwy.net:55514';
+const DB_NAME = 'duckads';
 
-mongoose.connect(MONGODB_URI, {
-    dbName: 'duckads'
-}).then(() => {
-    console.log('✅ Connected to MongoDB');
-}).catch(err => {
-    console.error('❌ MongoDB connection error:', err);
-});
+let db;
+let usersCollection;
+let adsCollection;
+let transactionsCollection;
 
-// ============= SCHEMAS =============
-
-const userSchema = new mongoose.Schema({
-    userId: { type: String, required: true, unique: true },
-    username: { type: String, default: null },
-    firstName: { type: String, default: null },
-    lastName: { type: String, default: null },
-    avatar: { type: String, default: null },
-    referrerId: { type: String, default: null },
-    
-    // Game data
-    balance: { type: Number, default: 0 },
-    level: { type: Number, default: 1 },
-    ads: { type: Number, default: 0 },
-    
-    // Ad blocks
-    block1views: { type: Number, default: 0 },
-    block1lock: { type: Number, default: 0 },
-    block2views: { type: Number, default: 0 },
-    block2lock: { type: Number, default: 0 },
-    block3views: { type: Number, default: 0 },
-    block3lock: { type: Number, default: 0 },
-    
-    // Boosts
-    doubleIncome: { type: Boolean, default: false },
-    doubleIncomeUntil: { type: Number, default: 0 },
-    autoClicker: { type: Boolean, default: false },
-    autoClickerUntil: { type: Number, default: 0 },
-    
-    // Tasks
-    tasks: {
-        subscribe: { type: Boolean, default: false },
-        share: { type: Boolean, default: false }
-    },
-    
-    // Referrals
-    referrals: [{ type: String }],
-    
-    createdAt: { type: Date, default: Date.now },
-    lastActive: { type: Date, default: Date.now }
-});
-
-const User = mongoose.model('User', userSchema);
-
-// ============= API ROUTES =============
-
-// Create or get user
-app.post('/api/user', async (req, res) => {
+// Подключение к MongoDB
+async function connectDB() {
     try {
-        const { userId, username, firstName, lastName, avatar, referrerId } = req.body;
+        const client = new MongoClient(MONGODB_URI);
+        await client.connect();
+        console.log('✅ Подключено к MongoDB');
         
-        console.log('📝 /api/user called:', { userId, username });
+        db = client.db(DB_NAME);
+        usersCollection = db.collection('users');
+        adsCollection = db.collection('ads_blocks');
+        transactionsCollection = db.collection('transactions');
         
-        if (!userId) {
-            return res.status(400).json({ error: 'userId is required' });
-        }
+        // Создаем индексы
+        await usersCollection.createIndex({ id: 1 }, { unique: true });
+        await usersCollection.createIndex({ token: 1 });
+        await usersCollection.createIndex({ balance: -1 });
         
-        let user = await User.findOne({ userId });
+        console.log('📊 Индексы созданы');
+    } catch (error) {
+        console.error('❌ Ошибка подключения к MongoDB:', error);
+        process.exit(1);
+    }
+}
+
+// Генерация токена
+function generateToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+// Middleware для проверки токена
+async function authMiddleware(req, res, next) {
+    const token = req.headers['authorization'];
+    if (!token) {
+        return res.status(401).json({ error: 'No token provided' });
+    }
+    
+    const user = await usersCollection.findOne({ token: token });
+    if (!user) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    req.user = user;
+    next();
+}
+
+// ==================== API РОУТЫ ====================
+
+// Регистрация/авторизация через Telegram
+app.post('/api/auth', async (req, res) => {
+    const { telegramId, name, avatar, referrerId } = req.body;
+    
+    if (!telegramId) {
+        return res.status(400).json({ error: 'telegramId required' });
+    }
+    
+    try {
+        let user = await usersCollection.findOne({ id: telegramId });
         
         if (!user) {
-            user = new User({
-                userId,
-                username: username || `user_${userId.slice(-6)}`,
-                firstName: firstName || null,
-                lastName: lastName || null,
-                avatar: avatar || null,
-                referrerId: referrerId || null,
+            // Создание нового пользователя
+            const newUser = {
+                id: telegramId,
+                name: name || 'User',
+                avatar: avatar || '',
                 balance: 0,
                 level: 1,
-                ads: 0
-            });
+                xp: 0,
+                boostDouble: false,
+                boostDoubleEnd: 0,
+                completedTasks: [],
+                referrals: [],
+                referrerId: referrerId || null,
+                token: generateToken(),
+                createdAt: new Date(),
+                lastSeen: new Date(),
+                totalWatched: 0
+            };
             
-            await user.save();
-            console.log(`🆕 NEW USER: ${userId}`);
+            const result = await usersCollection.insertOne(newUser);
+            user = newUser;
             
-            if (referrerId && referrerId !== userId) {
-                const referrer = await User.findOne({ userId: referrerId });
-                if (referrer && !referrer.referrals.includes(userId)) {
-                    referrer.referrals.push(userId);
-                    referrer.balance += 0.01;
-                    await referrer.save();
-                    console.log(`💰 Referral reward: ${referrerId} +0.01`);
+            // Награда за реферала
+            if (referrerId) {
+                const referrer = await usersCollection.findOne({ id: referrerId });
+                if (referrer) {
+                    await usersCollection.updateOne(
+                        { id: referrerId },
+                        { 
+                            $inc: { balance: 0.50 },
+                            $push: { referrals: telegramId }
+                        }
+                    );
                 }
             }
         } else {
-            user.lastActive = new Date();
-            await user.save();
-            console.log(`👤 EXISTING USER: ${userId}, balance: ${user.balance}, level: ${user.level}`);
+            // Обновление существующего пользователя
+            await usersCollection.updateOne(
+                { id: telegramId },
+                { 
+                    $set: { 
+                        name: name || user.name,
+                        avatar: avatar || user.avatar,
+                        lastSeen: new Date(),
+                        token: generateToken()
+                    }
+                }
+            );
+            user = await usersCollection.findOne({ id: telegramId });
         }
         
         res.json({
-            userId: user.userId,
-            username: user.username,
-            balance: user.balance,
-            level: user.level,
-            ads: user.ads,
-            avatar: user.avatar,
-            blocks: {
-                '1': { v: user.block1views, l: user.block1lock },
-                '2': { v: user.block2views, l: user.block2lock },
-                '3': { v: user.block3views, l: user.block3lock }
-            },
-            boosts: {
-                doubleIncome: user.doubleIncome,
-                doubleIncomeUntil: user.doubleIncomeUntil,
-                autoClicker: user.autoClicker,
-                autoClickerUntil: user.autoClickerUntil
-            },
-            tasks: user.tasks
+            success: true,
+            token: user.token,
+            user: {
+                id: user.id,
+                name: user.name,
+                avatar: user.avatar,
+                balance: user.balance,
+                level: user.level,
+                xp: user.xp,
+                boostDouble: user.boostDouble,
+                boostDoubleEnd: user.boostDoubleEnd,
+                completedTasks: user.completedTasks || [],
+                referrerId: user.referrerId
+            }
         });
-        
     } catch (error) {
-        console.error('Error in /api/user:', error);
-        res.status(500).json({ error: error.message });
+        console.error('Auth error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Save game data
-app.post('/api/save', async (req, res) => {
+// Получение данных пользователя
+app.get('/api/user', authMiddleware, async (req, res) => {
     try {
-        const { userId, balance, level, ads, blocks, boosts } = req.body;
+        res.json({
+            id: req.user.id,
+            name: req.user.name,
+            avatar: req.user.avatar,
+            balance: req.user.balance,
+            level: req.user.level,
+            xp: req.user.xp,
+            boostDouble: req.user.boostDouble,
+            boostDoubleEnd: req.user.boostDoubleEnd,
+            completedTasks: req.user.completedTasks || [],
+            referrerId: req.user.referrerId,
+            totalWatched: req.user.totalWatched || 0
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Сохранение прогресса
+app.post('/api/save', authMiddleware, async (req, res) => {
+    const { balance, level, xp, boostDouble, boostDoubleEnd, completedTasks, adsBlocks, autoMode } = req.body;
+    
+    try {
+        const updateData = {};
+        if (balance !== undefined) updateData.balance = balance;
+        if (level !== undefined) updateData.level = level;
+        if (xp !== undefined) updateData.xp = xp;
+        if (boostDouble !== undefined) updateData.boostDouble = boostDouble;
+        if (boostDoubleEnd !== undefined) updateData.boostDoubleEnd = boostDoubleEnd;
+        if (completedTasks !== undefined) updateData.completedTasks = completedTasks;
+        if (autoMode !== undefined) updateData.autoMode = autoMode;
+        updateData.lastSeen = new Date();
         
-        if (!userId) {
-            return res.status(400).json({ error: 'userId is required' });
+        await usersCollection.updateOne(
+            { id: req.user.id },
+            { $set: updateData }
+        );
+        
+        // Сохраняем рекламные блоки отдельно
+        if (adsBlocks) {
+            await adsCollection.updateOne(
+                { userId: req.user.id },
+                { $set: { blocks: adsBlocks, lastUpdate: new Date() } },
+                { upsert: true }
+            );
         }
-        
-        const user = await User.findOne({ userId });
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        
-        // Update user data
-        if (typeof balance !== 'undefined') user.balance = balance;
-        if (typeof level !== 'undefined') user.level = level;
-        if (typeof ads !== 'undefined') user.ads = ads;
-        
-        // Update blocks
-        if (blocks) {
-            if (blocks['1']) {
-                user.block1views = blocks['1'].v;
-                user.block1lock = blocks['1'].l;
-            }
-            if (blocks['2']) {
-                user.block2views = blocks['2'].v;
-                user.block2lock = blocks['2'].l;
-            }
-            if (blocks['3']) {
-                user.block3views = blocks['3'].v;
-                user.block3lock = blocks['3'].l;
-            }
-        }
-        
-        // Update boosts
-        if (boosts) {
-            if (typeof boosts.doubleIncome !== 'undefined') user.doubleIncome = boosts.doubleIncome;
-            if (typeof boosts.doubleIncomeUntil !== 'undefined') user.doubleIncomeUntil = boosts.doubleIncomeUntil;
-            if (typeof boosts.autoClicker !== 'undefined') user.autoClicker = boosts.autoClicker;
-            if (typeof boosts.autoClickerUntil !== 'undefined') user.autoClickerUntil = boosts.autoClickerUntil;
-        }
-        
-        await user.save();
-        
-        console.log(`✅ SAVED: ${userId} - balance: ${user.balance}, level: ${user.level}, ads: ${user.ads}`);
         
         res.json({ success: true });
-        
     } catch (error) {
-        console.error('Error in /api/save:', error);
-        res.status(500).json({ error: error.message });
+        console.error('Save error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Get user data
-app.get('/api/user/:userId', async (req, res) => {
+// Добавление реферала
+app.post('/api/addReferral', authMiddleware, async (req, res) => {
+    const { referrerId } = req.body;
+    
     try {
-        const { userId } = req.params;
-        
-        const user = await User.findOne({ userId });
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
+        if (referrerId && referrerId !== req.user.id && !req.user.referrerId) {
+            await usersCollection.updateOne(
+                { id: req.user.id },
+                { $set: { referrerId: referrerId } }
+            );
+            
+            // Награда рефереру
+            await usersCollection.updateOne(
+                { id: referrerId },
+                { 
+                    $inc: { balance: 0.50 },
+                    $push: { referrals: req.user.id }
+                }
+            );
         }
         
-        res.json({
-            userId: user.userId,
-            username: user.username,
-            balance: user.balance,
-            level: user.level,
-            ads: user.ads,
-            avatar: user.avatar,
-            blocks: {
-                '1': { v: user.block1views, l: user.block1lock },
-                '2': { v: user.block2views, l: user.block2lock },
-                '3': { v: user.block3views, l: user.block3lock }
-            },
-            boosts: {
-                doubleIncome: user.doubleIncome,
-                doubleIncomeUntil: user.doubleIncomeUntil,
-                autoClicker: user.autoClicker,
-                autoClickerUntil: user.autoClickerUntil
-            }
-        });
-        
+        res.json({ success: true });
     } catch (error) {
-        console.error('Error in /api/user/:userId GET:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Get leaderboard
+// Получение рекламных блоков пользователя
+app.get('/api/ads', authMiddleware, async (req, res) => {
+    try {
+        const adsData = await adsCollection.findOne({ userId: req.user.id });
+        if (adsData && adsData.blocks) {
+            res.json(adsData.blocks);
+        } else {
+            // Дефолтные блоки
+            const defaultBlocks = [
+                { id: 0, watched: 0, maxWatches: 15, rewardPerView: 0.0009 },
+                { id: 1, watched: 0, maxWatches: 15, rewardPerView: 0.0009 },
+                { id: 2, watched: 0, maxWatches: 15, rewardPerView: 0.0009 }
+            ];
+            res.json(defaultBlocks);
+        }
+    } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Получение топа игроков
 app.get('/api/leaderboard', async (req, res) => {
     try {
-        const users = await User.find({})
+        const leaders = await usersCollection
+            .find({})
             .sort({ balance: -1 })
             .limit(50)
-            .select('userId username balance level avatar');
+            .project({ name: 1, balance: 1, level: 1, avatar: 1 })
+            .toArray();
         
-        res.json(users);
-        
+        res.json(leaders);
     } catch (error) {
-        console.error('Error in /api/leaderboard:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Complete task
-app.post('/api/task', async (req, res) => {
+// Получение статистики
+app.get('/api/stats', async (req, res) => {
     try {
-        const { userId, taskId } = req.body;
+        const totalUsers = await usersCollection.countDocuments();
+        const totalBalanceResult = await usersCollection.aggregate([
+            { $group: { _id: null, total: { $sum: '$balance' } } }
+        ]).toArray();
+        const totalBalance = totalBalanceResult[0]?.total || 0;
         
-        console.log('📋 Task completed:', userId, taskId);
+        const totalWatchedResult = await usersCollection.aggregate([
+            { $group: { _id: null, total: { $sum: '$totalWatched' } } }
+        ]).toArray();
+        const totalWatched = totalWatchedResult[0]?.total || 0;
         
-        const user = await User.findOne({ userId });
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        
-        // Check if task already completed
-        if (user.tasks && user.tasks[taskId]) {
-            return res.json({ success: false, message: 'Task already completed' });
-        }
-        
-        // Mark task as completed
-        user.tasks[taskId] = true;
-        
-        // Give reward
-        const reward = taskId === 'subscribe' ? 1000 : 500;
-        user.balance += reward;
-        
-        await user.save();
-        
-        console.log(`✅ Task ${taskId} completed, +${reward} to ${userId}`);
-        res.json({ success: true, reward: reward });
-        
+        res.json({
+            totalUsers,
+            totalBalance: totalBalance.toFixed(2),
+            totalWatched
+        });
     } catch (error) {
-        console.error('Error in /api/task:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Withdraw funds
-app.post('/api/withdraw', async (req, res) => {
+// Создание транзакции (вывод средств)
+app.post('/api/withdraw', authMiddleware, async (req, res) => {
+    const { amount, wallet } = req.body;
+    
     try {
-        const { userId, amount } = req.body;
-        
-        console.log('💰 Withdraw request:', userId, amount);
-        
-        const user = await User.findOne({ userId });
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
+        if (req.user.balance < amount || amount < 1) {
+            return res.status(400).json({ error: 'Insufficient balance or invalid amount' });
         }
         
-        if (user.balance < amount) {
-            return res.status(400).json({ error: 'Insufficient balance' });
-        }
+        // Создаем запрос на вывод
+        const transaction = {
+            userId: req.user.id,
+            amount: amount,
+            wallet: wallet,
+            status: 'pending',
+            createdAt: new Date()
+        };
         
-        user.balance -= amount;
-        await user.save();
+        await transactionsCollection.insertOne(transaction);
         
-        console.log(`✅ Withdraw: ${userId} - $${amount}`);
-        res.json({ success: true, newBalance: user.balance });
+        // Резервируем средства
+        await usersCollection.updateOne(
+            { id: req.user.id },
+            { $inc: { balance: -amount } }
+        );
         
+        res.json({ success: true, transactionId: transaction._id });
     } catch (error) {
-        console.error('Error in /api/withdraw:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// Health check
-app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        timestamp: new Date(),
-        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+// Обновление просмотров
+app.post('/api/addWatch', authMiddleware, async (req, res) => {
+    try {
+        await usersCollection.updateOne(
+            { id: req.user.id },
+            { $inc: { totalWatched: 1 } }
+        );
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ==================== ЗАПУСК СЕРВЕРА ====================
+async function startServer() {
+    await connectDB();
+    
+    app.listen(PORT, () => {
+        console.log(`🚀 Сервер запущен на порту ${PORT}`);
+        console.log(`📱 Откройте http://localhost:${PORT}`);
+        console.log(`🗄️  База данных: ${DB_NAME}`);
     });
-});
+}
 
-// Root
-app.get('/', (req, res) => {
-    res.json({ message: 'Duck Ads API Server', version: '2.0' });
-});
-
-// ============= START SERVER =============
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-});
+startServer();
