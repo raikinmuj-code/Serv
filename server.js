@@ -13,42 +13,6 @@ app.use(express.static('public'));
 // MongoDB connection
 const MONGODB_URI = 'mongodb://mongo:MmFGAwrRIXPnPscZUhlXsMNZvHbGrPVs@yamanote.proxy.rlwy.net:55514';
 
-// Функция для очистки старых индексов
-async function cleanOldIndexes() {
-    try {
-        const db = mongoose.connection.db;
-        
-        // Проверяем существование коллекции
-        const collections = await db.listCollections({ name: 'users' }).toArray();
-        
-        if (collections.length > 0) {
-            console.log('📦 Found existing users collection, checking indexes...');
-            
-            // Получаем все индексы
-            const indexes = await db.collection('users').indexes();
-            
-            // Ищем старый индекс на поле 'id'
-            const oldIndex = indexes.find(idx => idx.key && idx.key.id);
-            
-            if (oldIndex) {
-                console.log('🗑️ Removing old index on "id" field...');
-                await db.collection('users').dropIndex('id_1');
-                console.log('✅ Old index removed');
-            }
-            
-            // Также проверяем на наличие дубликатов с null
-            const nullUsers = await db.collection('users').find({ userId: null }).toArray();
-            if (nullUsers.length > 0) {
-                console.log(`🗑️ Removing ${nullUsers.length} invalid users with null userId...`);
-                await db.collection('users').deleteMany({ userId: null });
-                console.log('✅ Invalid users removed');
-            }
-        }
-    } catch (error) {
-        console.warn('⚠️ Error cleaning indexes:', error.message);
-    }
-}
-
 mongoose.connect(MONGODB_URI, {
     dbName: 'duckads',
     retryWrites: true,
@@ -60,11 +24,31 @@ mongoose.connect(MONGODB_URI, {
     console.error('❌ MongoDB connection error:', err);
 });
 
+// Clean old indexes
+async function cleanOldIndexes() {
+    try {
+        const db = mongoose.connection.db;
+        const collections = await db.listCollections({ name: 'users' }).toArray();
+        
+        if (collections.length > 0) {
+            const indexes = await db.collection('users').indexes();
+            const oldIndex = indexes.find(idx => idx.key && idx.key.id);
+            
+            if (oldIndex) {
+                console.log('🗑️ Removing old index on "id" field...');
+                await db.collection('users').dropIndex('id_1');
+                console.log('✅ Old index removed');
+            }
+        }
+    } catch (error) {
+        console.warn('⚠️ Error cleaning indexes:', error.message);
+    }
+}
+
 // ============= SCHEMAS =============
 
-// User Schema - с явным указанием индексов
 const userSchema = new mongoose.Schema({
-    userId: { type: String, required: true, unique: true, index: true },
+    userId: { type: String, required: true, unique: true },
     username: { type: String, default: null },
     firstName: { type: String, default: null },
     lastName: { type: String, default: null },
@@ -73,19 +57,16 @@ const userSchema = new mongoose.Schema({
     isPremium: { type: Boolean, default: false },
     referrerId: { type: String, default: null },
     
-    // Game data
     balance: { type: Number, default: 0 },
     level: { type: Number, default: 1 },
     ads: { type: Number, default: 0 },
     
-    // Ad blocks
     blocks: {
         '1': { v: { type: Number, default: 0 }, l: { type: Number, default: 0 } },
         '2': { v: { type: Number, default: 0 }, l: { type: Number, default: 0 } },
         '3': { v: { type: Number, default: 0 }, l: { type: Number, default: 0 } }
     },
     
-    // Boosts
     boosts: {
         doubleIncome: { type: Boolean, default: false },
         doubleIncomeUntil: { type: Number, default: 0 },
@@ -93,36 +74,25 @@ const userSchema = new mongoose.Schema({
         autoClickerUntil: { type: Number, default: 0 }
     },
     
-    // Tasks
     tasks: {
         subscribe: { type: Boolean, default: false },
         share: { type: Boolean, default: false }
     },
     
-    // Referrals
     referrals: [{ type: String }],
     
-    // Timestamps
     createdAt: { type: Date, default: Date.now },
     lastActive: { type: Date, default: Date.now }
-}, {
-    // Отключаем автоматическое создание индекса _id
-    autoIndex: true
 });
 
-// Убеждаемся, что нет старого индекса
-userSchema.index({ userId: 1 }, { unique: true });
-
-// Withdrawal Schema
 const withdrawalSchema = new mongoose.Schema({
-    userId: { type: String, required: true, ref: 'User' },
+    userId: { type: String, required: true },
     amount: { type: Number, required: true },
     status: { type: String, enum: ['pending', 'completed', 'cancelled'], default: 'pending' },
     createdAt: { type: Date, default: Date.now },
     processedAt: { type: Date }
 });
 
-// Task Completion Schema
 const taskCompletionSchema = new mongoose.Schema({
     userId: { type: String, required: true },
     taskId: { type: String, required: true },
@@ -167,7 +137,6 @@ app.post('/api/user', async (req, res) => {
         let user = await User.findOne({ userId });
         
         if (!user) {
-            // Create new user
             user = new User({
                 userId,
                 username: username || `user_${userId.slice(-6)}`,
@@ -185,15 +154,13 @@ app.post('/api/user', async (req, res) => {
             await user.save();
             console.log(`🆕 New user created: ${userId}`);
             
-            // Process referral reward
             if (referrerId && referrerId !== userId) {
                 await updateReferralReward(referrerId, userId);
             }
         } else {
-            // Update last active
             user.lastActive = new Date();
             await user.save();
-            console.log(`👤 User logged in: ${userId}`);
+            console.log(`👤 User logged in: ${userId}, balance: ${user.balance}, level: ${user.level}`);
         }
         
         res.json({
@@ -215,11 +182,10 @@ app.post('/api/user', async (req, res) => {
     } catch (error) {
         console.error('Error in /api/user:', error);
         
-        // Обработка дубликата ключа
         if (error.code === 11000) {
             return res.status(409).json({ 
                 success: false, 
-                error: 'User already exists, please try again' 
+                error: 'User already exists' 
             });
         }
         
@@ -271,14 +237,12 @@ app.post('/api/save', async (req, res) => {
             return res.status(404).json({ success: false, error: 'User not found' });
         }
         
-        // Update user data
         if (userData) {
             if (typeof userData.balance !== 'undefined') user.balance = userData.balance;
             if (typeof userData.level !== 'undefined') user.level = userData.level;
             if (typeof userData.ads !== 'undefined') user.ads = userData.ads;
         }
         
-        // Update blocks
         if (blocks) {
             for (const [blockId, blockData] of Object.entries(blocks)) {
                 if (user.blocks[blockId]) {
@@ -288,12 +252,13 @@ app.post('/api/save', async (req, res) => {
             }
         }
         
-        // Update boosts
         if (boosts) {
             user.boosts = { ...user.boosts, ...boosts };
         }
         
         await user.save();
+        
+        console.log(`💾 Data saved: ${userId} - balance: ${user.balance}, level: ${user.level}`);
         
         res.json({ success: true, message: 'Data saved successfully' });
         
@@ -312,7 +277,6 @@ app.post('/api/task', async (req, res) => {
             return res.status(400).json({ success: false, error: 'userId and taskId are required' });
         }
         
-        // Check if task already completed
         const existingCompletion = await TaskCompletion.findOne({ userId, taskId });
         if (existingCompletion) {
             return res.json({ 
@@ -322,10 +286,8 @@ app.post('/api/task', async (req, res) => {
             });
         }
         
-        // Mark task as completed
         await TaskCompletion.create({ userId, taskId });
         
-        // Update user's task status
         const user = await User.findOne({ userId });
         if (user && user.tasks) {
             user.tasks[taskId] = true;
@@ -362,14 +324,12 @@ app.post('/api/withdraw', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Insufficient balance' });
         }
         
-        // Create withdrawal request
         const withdrawal = await Withdrawal.create({
             userId,
             amount,
             status: 'pending'
         });
         
-        // Deduct balance
         user.balance -= amount;
         await user.save();
         
@@ -469,7 +429,6 @@ app.post('/api/admin/withdrawals/:id/process', async (req, res) => {
         withdrawal.processedAt = new Date();
         await withdrawal.save();
         
-        // If cancelled, refund the user
         if (status === 'cancelled') {
             const user = await User.findOne({ userId: withdrawal.userId });
             if (user) {
@@ -483,6 +442,32 @@ app.post('/api/admin/withdrawals/:id/process', async (req, res) => {
     } catch (error) {
         console.error('Error in /api/admin/withdrawals/:id/process:', error);
         res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Debug endpoint - check user data
+app.get('/api/debug/user/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const user = await User.findOne({ userId });
+        
+        if (!user) {
+            return res.json({ exists: false });
+        }
+        
+        res.json({
+            exists: true,
+            userId: user.userId,
+            balance: user.balance,
+            level: user.level,
+            ads: user.ads,
+            blocks: user.blocks,
+            boosts: user.boosts,
+            createdAt: user.createdAt,
+            lastActive: user.lastActive
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -510,6 +495,7 @@ app.get('/', (req, res) => {
             'GET /api/referrals/:userId',
             'GET /api/admin/withdrawals',
             'POST /api/admin/withdrawals/:id/process',
+            'GET /api/debug/user/:userId',
             'GET /api/health'
         ]
     });
