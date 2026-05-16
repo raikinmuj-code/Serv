@@ -1,164 +1,457 @@
 const express = require('express');
-const { MongoClient } = require('mongodb');
+const mongoose = require('mongoose');
 const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: '*', credentials: true }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
 
-// ============= ПУТИ ДЛЯ СТАТИКИ =============
-const rootPath = path.join(__dirname, '..');
-app.use(express.static(rootPath));
-
-// ============= ПРЯМОЕ ПОДКЛЮЧЕНИЕ К MONGODB =============
+// MongoDB connection
 const MONGODB_URI = 'mongodb://mongo:MmFGAwrRIXPnPscZUhlXsMNZvHbGrPVs@yamanote.proxy.rlwy.net:55514';
-const DB_NAME = 'duckads';
-
-console.log('🔗 Подключаюсь к MongoDB:', MONGODB_URI.replace(/:[^:]*@/, ':****@'));
-
-let db;
-let usersCollection;
-let blocksCollection;
-
-async function connectDB() {
-    try {
-        const client = new MongoClient(MONGODB_URI);
-        await client.connect();
-        console.log('✅ MongoDB подключена!');
-        
-        db = client.db(DB_NAME);
-        usersCollection = db.collection('users');
-        blocksCollection = db.collection('user_blocks');
-        
-        await usersCollection.createIndex({ id: 1 }, { unique: true });
-        await blocksCollection.createIndex({ user_id: 1, block_id: 1 }, { unique: true });
-        
-        const count = await usersCollection.countDocuments();
-        console.log(`📊 Пользователей в базе: ${count}`);
-        
-        return true;
-    } catch (error) {
-        console.error('❌ Ошибка MongoDB:', error.message);
-        return false;
-    }
-}
-
-function generateUsername() {
-    const names = ['CryptoMaster', 'AdKing', 'TokenHunter', 'RewardSeeker', 'LevelUp'];
-    return names[Math.floor(Math.random() * names.length)] + Math.floor(Math.random() * 1000);
-}
-
-// ============= API =============
-app.post('/api/user', async (req, res) => {
-    const { userId, username, firstName, referrerId } = req.body;
-    const id = userId || `tg_${uuidv4()}`;
-    const displayName = username || firstName || generateUsername();
-    const avatar = `https://i.pravatar.cc/100?img=${Math.floor(Math.random() * 70)}`;
-    
-    try {
-        let user = await usersCollection.findOne({ id });
-        
-        if (user) {
-            await usersCollection.updateOne({ id }, { $set: { last_active: Date.now() } });
-            const blocks = await blocksCollection.find({ user_id: id }).toArray();
-            const blocksData = {};
-            blocks.forEach(b => { blocksData[b.block_id] = { v: b.views, l: b.locked_until }; });
-            
-            res.json({
-                success: true,
-                user: {
-                    id: user.id,
-                    username: user.username,
-                    avatar: user.avatar,
-                    balance: user.balance || 0,
-                    level: user.level || 1,
-                    ads: user.ads || 0
-                },
-                blocks: blocksData
-            });
-        } else {
-            const newUser = { id, username: displayName, avatar, balance: 0, level: 1, ads: 0, created_at: Date.now(), last_active: Date.now() };
-            await usersCollection.insertOne(newUser);
-            
-            for (let i = 1; i <= 3; i++) {
-                await blocksCollection.insertOne({ user_id: id, block_id: i, views: 0, locked_until: 0 });
-            }
-            
-            if (referrerId && referrerId !== id) {
-                await usersCollection.updateOne({ id: referrerId }, { $inc: { balance: 0.01 } });
-            }
-            
-            res.json({
-                success: true,
-                user: { id, username: displayName, avatar, balance: 0, level: 1, ads: 0 },
-                blocks: {}
-            });
-        }
-    } catch (error) {
-        console.error('Ошибка:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/api/save', async (req, res) => {
-    const { userId, user, blocks } = req.body;
-    
-    try {
-        await usersCollection.updateOne(
-            { id: userId },
-            { $set: { balance: user.balance, level: user.level, ads: user.ads, last_active: Date.now() } }
-        );
-        
-        for (const [blockId, blockData] of Object.entries(blocks)) {
-            await blocksCollection.updateOne(
-                { user_id: userId, block_id: parseInt(blockId) },
-                { $set: { views: blockData.v, locked_until: blockData.l } }
-            );
-        }
-        
-        console.log(`💾 Сохранено: ${userId}, баланс: ${user.balance}`);
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Ошибка:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.get('/api/leaderboard', async (req, res) => {
-    const users = await usersCollection.find({}).sort({ balance: -1 }).limit(50).toArray();
-    res.json(users);
-});
-
-app.get('/api/stats', async (req, res) => {
-    const totalUsers = await usersCollection.countDocuments();
-    res.json({ totalUsers });
-});
-
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-app.get('/', (req, res) => {
-    res.sendFile(path.join(rootPath, 'index.html'));
-});
-
-app.get('*', (req, res) => {
-    res.sendFile(path.join(rootPath, 'index.html'));
-});
-
-// ============= ЗАПУСК =============
-connectDB().then(() => {
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`🚀 Сервер на порту ${PORT}`);
-        console.log(`   API: http://localhost:${PORT}/api`);
-        console.log(`   Health: http://localhost:${PORT}/health`);
-    });
+mongoose.connect(MONGODB_URI, {
+    dbName: 'duckads',
+    retryWrites: true,
+    w: 'majority'
+}).then(() => {
+    console.log('✅ Connected to MongoDB');
 }).catch(err => {
-    console.error('❌ Ошибка запуска:', err);
-    process.exit(1);
+    console.error('❌ MongoDB connection error:', err);
+});
+
+// ============= SCHEMAS =============
+
+// User Schema
+const userSchema = new mongoose.Schema({
+    userId: { type: String, required: true, unique: true },
+    username: { type: String, default: null },
+    firstName: { type: String, default: null },
+    lastName: { type: String, default: null },
+    avatar: { type: String, default: null },
+    languageCode: { type: String, default: 'ru' },
+    isPremium: { type: Boolean, default: false },
+    referrerId: { type: String, default: null },
+    
+    // Game data
+    balance: { type: Number, default: 0 },
+    level: { type: Number, default: 1 },
+    ads: { type: Number, default: 0 },
+    
+    // Ad blocks
+    blocks: {
+        '1': { v: { type: Number, default: 0 }, l: { type: Number, default: 0 } },
+        '2': { v: { type: Number, default: 0 }, l: { type: Number, default: 0 } },
+        '3': { v: { type: Number, default: 0 }, l: { type: Number, default: 0 } }
+    },
+    
+    // Boosts
+    boosts: {
+        doubleIncome: { type: Boolean, default: false },
+        doubleIncomeUntil: { type: Number, default: 0 },
+        autoClicker: { type: Boolean, default: false },
+        autoClickerUntil: { type: Number, default: 0 }
+    },
+    
+    // Tasks
+    tasks: {
+        subscribe: { type: Boolean, default: false },
+        share: { type: Boolean, default: false }
+    },
+    
+    // Referrals
+    referrals: [{ type: String }],
+    
+    // Timestamps
+    createdAt: { type: Date, default: Date.now },
+    lastActive: { type: Date, default: Date.now }
+});
+
+// Withdrawal Schema
+const withdrawalSchema = new mongoose.Schema({
+    userId: { type: String, required: true, ref: 'User' },
+    amount: { type: Number, required: true },
+    status: { type: String, enum: ['pending', 'completed', 'cancelled'], default: 'pending' },
+    createdAt: { type: Date, default: Date.now },
+    processedAt: { type: Date }
+});
+
+// Task Completion Schema
+const taskCompletionSchema = new mongoose.Schema({
+    userId: { type: String, required: true },
+    taskId: { type: String, required: true },
+    completedAt: { type: Date, default: Date.now }
+});
+
+// Compound index for unique task completions
+taskCompletionSchema.index({ userId: 1, taskId: 1 }, { unique: true });
+
+const User = mongoose.model('User', userSchema);
+const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
+const TaskCompletion = mongoose.model('TaskCompletion', taskCompletionSchema);
+
+// ============= HELPER FUNCTIONS =============
+
+async function checkAndUpdateLevel(user) {
+    let leveled = false;
+    while (user.ads >= 100) {
+        user.level += 1;
+        user.ads = 0;
+        leveled = true;
+    }
+    return leveled;
+}
+
+async function updateReferralReward(referrerId, newUserId) {
+    if (!referrerId) return;
+    
+    try {
+        const referrer = await User.findOne({ userId: referrerId });
+        if (referrer) {
+            // Add to referrals list if not already there
+            if (!referrer.referrals.includes(newUserId)) {
+                referrer.referrals.push(newUserId);
+                // Reward: 10% of start balance or fixed 0.01
+                referrer.balance += 0.01;
+                await referrer.save();
+                console.log(`💰 Referral reward: ${referrerId} +0.01 from ${newUserId}`);
+            }
+        }
+    } catch (error) {
+        console.error('Error updating referral reward:', error);
+    }
+}
+
+// ============= API ROUTES =============
+
+// Create or get user
+app.post('/api/user', async (req, res) => {
+    try {
+        const { userId, username, firstName, lastName, avatar, languageCode, isPremium, referrerId } = req.body;
+        
+        let user = await User.findOne({ userId });
+        
+        if (!user) {
+            // Create new user
+            user = new User({
+                userId,
+                username: username || `user_${userId.slice(-6)}`,
+                firstName: firstName || null,
+                lastName: lastName || null,
+                avatar: avatar || null,
+                languageCode: languageCode || 'ru',
+                isPremium: isPremium || false,
+                referrerId: referrerId || null,
+                balance: 0,
+                level: 1,
+                ads: 0
+            });
+            
+            await user.save();
+            console.log(`🆕 New user created: ${userId}`);
+            
+            // Process referral reward
+            if (referrerId && referrerId !== userId) {
+                await updateReferralReward(referrerId, userId);
+            }
+        } else {
+            // Update last active
+            user.lastActive = new Date();
+            await user.save();
+            console.log(`👤 User logged in: ${userId}`);
+        }
+        
+        // Get referrer count
+        const referrerCount = user.referrals ? user.referrals.length : 0;
+        
+        res.json({
+            success: true,
+            user: {
+                id: user._id,
+                userId: user.userId,
+                username: user.username,
+                balance: user.balance,
+                level: user.level,
+                ads: user.ads,
+                avatar: user.avatar
+            },
+            blocks: user.blocks,
+            boosts: user.boosts,
+            referrerCount
+        });
+        
+    } catch (error) {
+        console.error('Error in /api/user:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get user data
+app.get('/api/user/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        
+        const user = await User.findOne({ userId });
+        if (!user) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        
+        res.json({
+            success: true,
+            user: {
+                userId: user.userId,
+                username: user.username,
+                balance: user.balance,
+                level: user.level,
+                ads: user.ads,
+                avatar: user.avatar
+            },
+            blocks: user.blocks,
+            boosts: user.boosts
+        });
+        
+    } catch (error) {
+        console.error('Error in /api/user/:userId:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Save game data
+app.post('/api/save', async (req, res) => {
+    try {
+        const { userId, user: userData, blocks, boosts } = req.body;
+        
+        const user = await User.findOne({ userId });
+        if (!user) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        
+        // Update user data
+        if (userData) {
+            user.balance = userData.balance;
+            user.level = userData.level;
+            user.ads = userData.ads;
+        }
+        
+        // Update blocks
+        if (blocks) {
+            for (const [blockId, blockData] of Object.entries(blocks)) {
+                if (user.blocks[blockId]) {
+                    user.blocks[blockId].v = blockData.v;
+                    user.blocks[blockId].l = blockData.l;
+                }
+            }
+        }
+        
+        // Update boosts
+        if (boosts) {
+            user.boosts = boosts;
+        }
+        
+        await user.save();
+        
+        res.json({ success: true, message: 'Data saved successfully' });
+        
+    } catch (error) {
+        console.error('Error in /api/save:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Complete task
+app.post('/api/task', async (req, res) => {
+    try {
+        const { userId, taskId } = req.body;
+        
+        // Check if task already completed
+        const existingCompletion = await TaskCompletion.findOne({ userId, taskId });
+        if (existingCompletion) {
+            return res.json({ 
+                success: false, 
+                message: 'Task already completed',
+                completed: true 
+            });
+        }
+        
+        // Mark task as completed
+        await TaskCompletion.create({ userId, taskId });
+        
+        // Update user's task status
+        const user = await User.findOne({ userId });
+        if (user && user.tasks) {
+            user.tasks[taskId] = true;
+            await user.save();
+        }
+        
+        res.json({ success: true, message: 'Task completed successfully' });
+        
+    } catch (error) {
+        console.error('Error in /api/task:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Withdraw funds
+app.post('/api/withdraw', async (req, res) => {
+    try {
+        const { userId, amount } = req.body;
+        
+        if (amount < 0.01) {
+            return res.status(400).json({ success: false, error: 'Minimum withdrawal amount is $0.01' });
+        }
+        
+        const user = await User.findOne({ userId });
+        if (!user) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        
+        if (user.balance < amount) {
+            return res.status(400).json({ success: false, error: 'Insufficient balance' });
+        }
+        
+        // Create withdrawal request
+        const withdrawal = await Withdrawal.create({
+            userId,
+            amount,
+            status: 'pending'
+        });
+        
+        // Deduct balance (but keep record for processing)
+        user.balance -= amount;
+        await user.save();
+        
+        console.log(`💰 Withdrawal request: ${userId} - $${amount}`);
+        
+        res.json({ 
+            success: true, 
+            message: 'Withdrawal request submitted successfully',
+            withdrawalId: withdrawal._id
+        });
+        
+    } catch (error) {
+        console.error('Error in /api/withdraw:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get leaderboard
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        const users = await User.find({})
+            .sort({ balance: -1 })
+            .limit(50)
+            .select('userId username balance level avatar');
+        
+        const leaderboard = users.map(user => ({
+            userId: user.userId,
+            username: user.username || user.userId.slice(0, 8),
+            balance: user.balance,
+            level: user.level,
+            avatar: user.avatar
+        }));
+        
+        res.json(leaderboard);
+        
+    } catch (error) {
+        console.error('Error in /api/leaderboard:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get user referrals
+app.get('/api/referrals/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        
+        const user = await User.findOne({ userId });
+        if (!user) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        
+        const referrals = await User.find({ userId: { $in: user.referrals } })
+            .select('userId username level balance');
+        
+        res.json({
+            success: true,
+            count: user.referrals.length,
+            referrals: referrals.map(ref => ({
+                username: ref.username || ref.userId.slice(0, 8),
+                level: ref.level,
+                balance: ref.balance
+            }))
+        });
+        
+    } catch (error) {
+        console.error('Error in /api/referrals/:userId:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Admin: Get withdrawal requests
+app.get('/api/admin/withdrawals', async (req, res) => {
+    try {
+        const withdrawals = await Withdrawal.find({ status: 'pending' })
+            .sort({ createdAt: -1 });
+        
+        res.json(withdrawals);
+        
+    } catch (error) {
+        console.error('Error in /api/admin/withdrawals:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Admin: Process withdrawal
+app.post('/api/admin/withdrawals/:id/process', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+        
+        const withdrawal = await Withdrawal.findById(id);
+        if (!withdrawal) {
+            return res.status(404).json({ success: false, error: 'Withdrawal not found' });
+        }
+        
+        withdrawal.status = status;
+        withdrawal.processedAt = new Date();
+        await withdrawal.save();
+        
+        // If cancelled, refund the user
+        if (status === 'cancelled') {
+            const user = await User.findOne({ userId: withdrawal.userId });
+            if (user) {
+                user.balance += withdrawal.amount;
+                await user.save();
+            }
+        }
+        
+        res.json({ success: true, message: `Withdrawal ${status}` });
+        
+    } catch (error) {
+        console.error('Error in /api/admin/withdrawals/:id/process:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date(),
+        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    });
+});
+
+// Serve static files
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ============= START SERVER =============
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📊 API available at http://localhost:${PORT}/api`);
 });
