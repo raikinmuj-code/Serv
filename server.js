@@ -48,6 +48,12 @@ const userSchema = new mongoose.Schema({
     autoClicker: { type: Boolean, default: false },
     autoClickerUntil: { type: Number, default: 0 },
     
+    // Tasks
+    tasks: {
+        subscribe: { type: Boolean, default: false },
+        share: { type: Boolean, default: false }
+    },
+    
     // Referrals
     referrals: [{ type: String }],
     
@@ -64,7 +70,7 @@ app.post('/api/user', async (req, res) => {
     try {
         const { userId, username, firstName, lastName, avatar, referrerId } = req.body;
         
-        console.log('📝 /api/user called with:', { userId, username, referrerId });
+        console.log('📝 /api/user called:', { userId, username });
         
         if (!userId) {
             return res.status(400).json({ error: 'userId is required' });
@@ -73,7 +79,6 @@ app.post('/api/user', async (req, res) => {
         let user = await User.findOne({ userId });
         
         if (!user) {
-            // Create new user
             user = new User({
                 userId,
                 username: username || `user_${userId.slice(-6)}`,
@@ -89,7 +94,6 @@ app.post('/api/user', async (req, res) => {
             await user.save();
             console.log(`🆕 NEW USER: ${userId}`);
             
-            // Give referral reward to referrer
             if (referrerId && referrerId !== userId) {
                 const referrer = await User.findOne({ userId: referrerId });
                 if (referrer && !referrer.referrals.includes(userId)) {
@@ -102,10 +106,9 @@ app.post('/api/user', async (req, res) => {
         } else {
             user.lastActive = new Date();
             await user.save();
-            console.log(`👤 EXISTING USER: ${userId}, balance: ${user.balance}, level: ${user.level}, ads: ${user.ads}`);
+            console.log(`👤 EXISTING USER: ${userId}, balance: ${user.balance}, level: ${user.level}`);
         }
         
-        // Return full user data
         res.json({
             userId: user.userId,
             username: user.username,
@@ -123,7 +126,8 @@ app.post('/api/user', async (req, res) => {
                 doubleIncomeUntil: user.doubleIncomeUntil,
                 autoClicker: user.autoClicker,
                 autoClickerUntil: user.autoClickerUntil
-            }
+            },
+            tasks: user.tasks
         });
         
     } catch (error) {
@@ -136,9 +140,6 @@ app.post('/api/user', async (req, res) => {
 app.post('/api/save', async (req, res) => {
     try {
         const { userId, balance, level, ads, blocks, boosts } = req.body;
-        
-        console.log('💾 /api/save called for:', userId);
-        console.log('   Data:', { balance, level, ads });
         
         if (!userId) {
             return res.status(400).json({ error: 'userId is required' });
@@ -195,8 +196,6 @@ app.get('/api/user/:userId', async (req, res) => {
     try {
         const { userId } = req.params;
         
-        console.log('📥 /api/user/:userId GET for:', userId);
-        
         const user = await User.findOne({ userId });
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
@@ -251,10 +250,27 @@ app.post('/api/task', async (req, res) => {
         
         console.log('📋 Task completed:', userId, taskId);
         
-        // For now, just return success
-        // You can add task completion tracking later
+        const user = await User.findOne({ userId });
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
         
-        res.json({ success: true });
+        // Check if task already completed
+        if (user.tasks && user.tasks[taskId]) {
+            return res.json({ success: false, message: 'Task already completed' });
+        }
+        
+        // Mark task as completed
+        user.tasks[taskId] = true;
+        
+        // Give reward
+        const reward = taskId === 'subscribe' ? 1000 : 500;
+        user.balance += reward;
+        
+        await user.save();
+        
+        console.log(`✅ Task ${taskId} completed, +${reward} to ${userId}`);
+        res.json({ success: true, reward: reward });
         
     } catch (error) {
         console.error('Error in /api/task:', error);
@@ -281,7 +297,8 @@ app.post('/api/withdraw', async (req, res) => {
         user.balance -= amount;
         await user.save();
         
-        res.json({ success: true });
+        console.log(`✅ Withdraw: ${userId} - $${amount}`);
+        res.json({ success: true, newBalance: user.balance });
         
     } catch (error) {
         console.error('Error in /api/withdraw:', error);
